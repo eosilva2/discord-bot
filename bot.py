@@ -16,8 +16,7 @@ LEET_MAP = str.maketrans({
     "0":"o","1":"i","!":"i","3":"e","4":"a","@":"a","$":"s","5":"s","7":"t","8":"b","+":"t","|":"l"
 })
 
-# Extra Unicode folding for letters that aren't just "accent + base"
-# (NFKD removes accents, but chars like ħ/ł/đ/ß need explicit folding)
+# Unicode folding for characters not handled by accent stripping alone
 UNICODE_FOLD_MAP = {
     "ß": "ss", "þ": "th", "ð": "d", "đ": "d", "ħ": "h", "ł": "l",
     "ø": "o", "œ": "oe", "æ": "ae", "å": "a",
@@ -25,11 +24,11 @@ UNICODE_FOLD_MAP = {
     "č": "c", "ć": "c", "ç": "c",
     "ñ": "n", "ğ": "g",
     "ý": "y",
+    "ı": "i",  # dotless i
 }
 UNI_TRANS = str.maketrans(UNICODE_FOLD_MAP)
 
 def strip_accents(text: str) -> str:
-    # Decompose characters and drop combining marks
     nfkd = unicodedata.normalize("NFKD", text)
     return "".join(ch for ch in nfkd if unicodedata.category(ch) != "Mn")
 
@@ -40,7 +39,7 @@ def normalize(text: str) -> str:
     """
     text = text.lower()
     text = strip_accents(text)
-    text = text.translate(UNI_TRANS)      # ħ -> h, ł -> l, ß -> ss, ...
+    text = text.translate(UNI_TRANS)      # ħ -> h, ł -> l, ß -> ss, ı -> i, ...
     text = text.translate(LEET_MAP)       # 0->o, @->a, etc.
     # Keep only ascii letters/digits/@ and whitespace
     text = re.sub(r"[^a-z0-9@\s]", " ", text)
@@ -80,7 +79,7 @@ def save_config(cfg):
     except Exception:
         pass
 
-config = load_config()  # {"<guild_id>": {words, window}, "_default": {words, window}}
+config = load_config()
 
 def get_guild_cfg(guild_id: int):
     g = str(guild_id)
@@ -89,11 +88,35 @@ def get_guild_cfg(guild_id: int):
         save_config(config)
     return config[g]
 
-# ---------------- Dynamic ban list with patterns ----------------
-def spaced_pat(s: str) -> str:
-    # "test" -> "t\s*e\s*s\s*t\s*" (matches t e s t, t---e__s t, etc.)
-    return r"".join(re.escape(c) + r"\s*" for c in s)
+# ---------------- Confusable-aware pattern builder ----------------
+# Minimal, targeted homoglyph/leet classes to avoid false positives
+CONFUSABLES = {
+    "i": ["i","l","1"],         # i ~ l ~ 1
+    "l": ["l","i","1"],         # l ~ i ~ 1
+    "o": ["o","0"],             # o ~ 0
+    "s": ["s","5","$"],         # s ~ 5/$
+    "e": ["e","3"],
+    "a": ["a","4","@"],
+    "t": ["t","7","+"],
+    "b": ["b","8"],
+    # you can add more selectively if needed
+}
 
+def confusable_group(ch: str) -> str:
+    opts = CONFUSABLES.get(ch, [ch])
+    # join as alternation group, escape each literal
+    return f"(?:{'|'.join(re.escape(o) for o in opts)})"
+
+def confusable_spaced_pat(s: str) -> str:
+    """
+    Build a regex that matches s even if spaces are inserted between letters
+    and confusable glyphs are used for individual characters.
+    We do NOT add trailing \s* after the last char to keep word boundaries working.
+    """
+    parts = [confusable_group(c) for c in s]
+    return r"\s*".join(parts)
+
+# ---------------- Dynamic ban list with patterns ----------------
 def compile_ban_patterns(raw: str):
     patterns = []
     for item in [x.strip() for x in raw.split(",") if x.strip()]:
@@ -102,18 +125,19 @@ def compile_ban_patterns(raw: str):
         base_norm = normalize(base)
         if not base_norm:
             continue
+        core = confusable_spaced_pat(base_norm)
         if is_stem:
-            pat = rf"\b{spaced_pat(base_norm)}[a-z0-9]*\b"   # stems: gay* -> gay/gays/g a y/etc.
+            pat = rf"\b{core}[a-z0-9]*\b"     # allow suffixes for stems
         else:
-            pat = rf"\b{spaced_pat(base_norm)}\b"            # exact word (spacing tolerated)
+            pat = rf"\b{core}\b"              # exact word (spacing tolerated)
         patterns.append(re.compile(pat))
     return patterns
 
 BAN_PATTERNS = compile_ban_patterns(os.getenv("BAN_WORDS", ""))
 
-# Always-ban baseline (compiled too)
+# Always-ban baseline (compiled with confusable/spacing too)
 ALWAYS_BAN = {"hoe", "hoes", "cunt", "bitch", "bitches"}
-ALWAYS_PATTERNS = [re.compile(rf"\b{spaced_pat(normalize(w))}\b") for w in ALWAYS_BAN]
+ALWAYS_PATTERNS = [re.compile(rf"\b{confusable_spaced_pat(normalize(w))}\b") for w in ALWAYS_BAN]
 
 def contains_banned_word(norm_text: str) -> bool:
     for p in ALWAYS_PATTERNS:
@@ -286,7 +310,7 @@ async def help_cmd(ctx):
         "`!config` – show current settings\n\n"
         f"**Current (this server):** words = [{words}] | window = {gcfg['window']}s\n"
         f"**Defaults (from ENV):** [{default_words}] | window = {config['_default']['window']}s\n"
-        "Built-ins: cheater accusations, bitch, super-strict 'f you', player, loyalty, BAN_WORDS, always-ban list, spelled-out letters, and Unicode/accents handling."
+        "Built-ins: cheater accusations, bitch, super-strict 'f you', player, loyalty, BAN_WORDS, always-ban list, spelled-out letters, Unicode/accents & homoglyph handling."
     )
 
 @bot.command(name="config")
@@ -387,6 +411,7 @@ if not TOKEN:
     print("ERROR: Missing DISCORD_BOT_TOKEN")
     raise SystemExit(1)
 bot.run(TOKEN)
+
 
 
 
