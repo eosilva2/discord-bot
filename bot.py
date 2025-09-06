@@ -35,15 +35,14 @@ def strip_accents(text: str) -> str:
 
 def normalize(text: str) -> str:
     """
-    Lowercase, strip accents, fold special unicode, convert common leetspeak,
+    Lowercase, strip accents, fold special unicode, convert leetspeak,
     remove punctuation/newlines, collapse spaces.
     """
     text = text.lower()
     text = strip_accents(text)
-    text = text.translate(UNI_TRANS)      # ħ -> h, ł -> l, ß -> ss, ı -> i, ...
+    text = text.translate(UNI_TRANS)      # ħ->h, ł->l, ß->ss, ı->i, ...
     text = text.translate(LEET_MAP)       # 0->o, @->a, etc.
-    # Keep only ascii letters/digits/@ and whitespace
-    text = re.sub(r"[^a-z0-9@\s]", " ", text)
+    text = re.sub(r"[^a-z0-9@\s]", " ", text)  # keep @ for mentions
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -243,7 +242,7 @@ def get_recent_key(message: discord.Message):
 
 def get_aggregate_text(dq: deque, now: float, window: int) -> tuple[str, bool, list]:
     while dq and (now - dq[0]["time"]) > window:
-        dq.popleft()
+        dq.popLeft = dq.popleft()
     agg_text = " ".join(item["norm"] for item in dq)
     agg_mentions = any(item["had_mention"] for item in dq)
     recent = [item for item in dq if (now - item["time"]) <= window]
@@ -288,12 +287,12 @@ def is_guild_manager():
         return ctx.author.guild_permissions.manage_guild
     return commands.check(predicate)
 
-# -------- Slash command: /say (only visible/usable by server managers) --------
-@bot.tree.command(name="say", description="Make the bot say something in a channel")
+# -------- Slash command: /speak (only visible/usable by server managers) --------
+@bot.tree.command(name="speak", description="Make the bot say something in a channel")
 @app_commands.describe(text="What should I say?", channel="Where to send it (optional)")
 @app_commands.default_permissions(manage_guild=True)   # only server managers see/use it
 @app_commands.guild_only()
-async def say_slash(
+async def speak_slash(
     interaction: discord.Interaction,
     text: str,
     channel: Optional[discord.TextChannel] = None
@@ -305,7 +304,7 @@ async def say_slash(
         return
 
     try:
-        await target.send(text)  # This is posted publicly AS THE BOT (bot bypasses filters)
+        await target.send(text)  # Posted publicly AS THE BOT (bot bypasses filters)
         await interaction.response.send_message("Sent ✅", ephemeral=True)  # only you see this
     except discord.Forbidden:
         await interaction.response.send_message("I can't send messages in that channel (missing permission).", ephemeral=True)
@@ -358,9 +357,8 @@ async def setwindow_cmd(ctx, seconds: int):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    # Register slash commands
     try:
-        await bot.tree.sync()
+        await bot.tree.sync()  # register slash commands
         print("Slash commands synced.")
     except Exception as e:
         print("Slash sync failed:", e)
@@ -374,7 +372,7 @@ async def on_message(message: discord.Message):
     # Let prefix commands run
     await bot.process_commands(message)
 
-    # BOT BYPASS: ignore bot messages so the bot can say anything (including cussing) without deletion
+    # BOT BYPASS: ignore bot messages so the bot can say anything without deletion
     if message.author.bot or not message.guild:
         return
 
@@ -438,6 +436,7 @@ if not TOKEN:
     print("ERROR: Missing DISCORD_BOT_TOKEN")
     raise SystemExit(1)
 bot.run(TOKEN)
+
 
 
 
