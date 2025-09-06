@@ -26,7 +26,7 @@ UNICODE_FOLD_MAP = {
     "č": "c", "ć": "c", "ç": "c",
     "ñ": "n", "ğ": "g",
     "ý": "y",
-    "ı": "i",  # dotless i
+    "ı": "i",
 }
 UNI_TRANS = str.maketrans(UNICODE_FOLD_MAP)
 
@@ -35,14 +35,10 @@ def strip_accents(text: str) -> str:
     return "".join(ch for ch in nfkd if unicodedata.category(ch) != "Mn")
 
 def normalize(text: str) -> str:
-    """
-    Lowercase, strip accents, fold special unicode, convert leetspeak,
-    remove punctuation/newlines, collapse spaces.
-    """
     text = text.lower()
     text = strip_accents(text)
-    text = text.translate(UNI_TRANS)      # ħ->h, ł->l, ß->ss, ı->i, ...
-    text = text.translate(LEET_MAP)       # 0->o, @->a, etc.
+    text = text.translate(UNI_TRANS)
+    text = text.translate(LEET_MAP)
     text = re.sub(r"[^a-z0-9@\s]", " ", text)  # keep @ for mentions
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -53,7 +49,7 @@ def has_word(norm_text: str, word: str) -> bool:
 def any_word(norm_text: str, words: List[str]) -> bool:
     return any(has_word(norm_text, w) for w in words)
 
-# ---------------- Config: prefer ENV, fallback to file ----------------
+# ---------------- Config ----------------
 def load_config():
     words_env = os.getenv("WORDS")
     window_env = os.getenv("WINDOW")
@@ -80,7 +76,7 @@ def save_config(cfg):
     except Exception:
         pass
 
-config = load_config()  # {"<guild_id>": {words, window}, "_default": {words, window}}
+config = load_config()
 
 def get_guild_cfg(guild_id: int):
     g = str(guild_id)
@@ -100,17 +96,14 @@ CONFUSABLES = {
     "t": ["t","7","+"],
     "b": ["b","8"],
 }
-
 def confusable_group(ch: str) -> str:
     opts = CONFUSABLES.get(ch, [ch])
     return f"(?:{'|'.join(re.escape(o) for o in opts)})"
-
 def confusable_spaced_pat(s: str) -> str:
-    # Build regex that matches s even with spaces and confusable glyphs
     parts = [confusable_group(c) for c in s]
     return r"\s*".join(parts)
 
-# ---------------- Dynamic ban list with patterns ----------------
+# ---------------- Dynamic ban list ----------------
 def compile_ban_patterns(raw: str):
     patterns = []
     for item in [x.strip() for x in raw.split(",") if x.strip()]:
@@ -121,15 +114,14 @@ def compile_ban_patterns(raw: str):
             continue
         core = confusable_spaced_pat(base_norm)
         if is_stem:
-            pat = rf"\b{core}[a-z0-9]*\b"     # allow suffixes for stems
+            pat = rf"\b{core}[a-z0-9]*\b"
         else:
-            pat = rf"\b{core}\b"              # exact word (spacing tolerated)
+            pat = rf"\b{core}\b"
         patterns.append(re.compile(pat))
     return patterns
 
 BAN_PATTERNS = compile_ban_patterns(os.getenv("BAN_WORDS", ""))
 
-# Always-ban baseline (compiled with confusable/spacing too)
 ALWAYS_BAN = {"hoe", "hoes", "cunt", "bitch", "bitches"}
 ALWAYS_PATTERNS = [re.compile(rf"\b{confusable_spaced_pat(normalize(w))}\b") for w in ALWAYS_BAN]
 
@@ -142,7 +134,7 @@ def contains_banned_word(norm_text: str) -> bool:
             return True
     return False
 
-# ---------------- Moderation rules (semantic) ----------------
+# ---------------- Semantic rules ----------------
 PRONOUN_TARGETS = {
     "you","u","ur","youre","he","she","they","him","her","them",
     "this","that","it","these","those",
@@ -175,19 +167,13 @@ def is_bitch_insult(norm_text: str, has_mention: bool) -> bool:
     return False
 
 def is_fuck_you_super_strict(norm_text: str) -> bool:
-    if re.search(r"\bfu?c?k+\s*you\b", norm_text):
-        return True
-    if re.search(r"\bf\s*you\b", norm_text):
-        return True
-    if re.search(r"\bf\s*u\b", norm_text):
-        return True
-    if re.search(r"\bfu?h+\s*u\b", norm_text):
-        return True
-    if re.search(r"\bfu\b", norm_text) and has_word(norm_text, "you"):
-        return True
+    if re.search(r"\bfu?c?k+\s*you\b", norm_text): return True
+    if re.search(r"\bf\s*you\b", norm_text): return True
+    if re.search(r"\bf\s*u\b", norm_text): return True
+    if re.search(r"\bfu?h+\s*u\b", norm_text): return True
+    if re.search(r"\bfu\b", norm_text) and has_word(norm_text, "you"): return True
     return False
 
-# Player implication
 PLAYER_TERMS = {
     "player","playboy","womanizer","womaniser","womanizers","womanisers",
     "fboy","fboi","fuckboy","fuckboi","manwhore"
@@ -197,49 +183,32 @@ QTY_WORDS = {"hella","many","every","all","lots","lot","alot","a lot"}
 
 def is_player_implication(norm_text: str, has_mention: bool) -> bool:
     if any_word(norm_text, list(PLAYER_TERMS)) or "player" in norm_text:
-        if is_directed(norm_text, has_mention):
-            return True
-        if re.search(r"\b\w{2,}\s+(?:is|s|is a|s a|a)\s+player\b", norm_text):
-            return True
+        if is_directed(norm_text, has_mention): return True
+        if re.search(r"\b\w{2,}\s+(?:is|s|is a|s a|a)\s+player\b", norm_text): return True
     if (any_word(norm_text, list(QTY_WORDS)) and any_word(norm_text, list(GIRL_WORDS))):
-        if re.search(r"\b(got|has|have)\b", norm_text) or is_directed(norm_text, has_mention):
-            return True
+        if re.search(r"\b(got|has|have)\b", norm_text) or is_directed(norm_text, has_mention): return True
     qty = r"(a\s+lot\s+of|many|every|all|lots\s+of|hella)"
     girls = r"(girls?|women|females?|hoes?)"
-    if re.search(rf"\b(talk|text|dm|message|chat)(s|ed|ing)?\s+(to|with)\s+{qty}\s+{girls}\b", norm_text):
-        return True
-    if re.search(rf"\b(flirt|rizz)(s|ed|ing)?\s+(with\s+)?{qty}\s+{girls}\b", norm_text):
-        return True
+    if re.search(rf"\b(talk|text|dm|message|chat)(s|ed|ing)?\s+(to|with)\s+{qty}\s+{girls}\b", norm_text): return True
+    if re.search(rf"\b(flirt|rizz)(s|ed|ing)?\s+(with\s+)?{qty}\s+{girls}\b", norm_text): return True
     if re.search(r"\b(slide|sliding|slid|slides)\s+(in|into)\s+(\w+\s+)?dm(s)?\b", norm_text) and (
         any_word(norm_text, ["everyone","every","all","many","hella"]) or any_word(norm_text, list(GIRL_WORDS))
-    ):
-        return True
+    ): return True
     return False
 
-# Loyalty / serial-dating implication
 def is_loyalty_implication(norm_text: str, has_mention: bool) -> bool:
-    if re.search(r"\b\w{2,}\s+(?:lacks|lack|has\s+no|got\s+no|no)\s+loyalty\b", norm_text):
-        return True
-    if re.search(r"\b\w{2,}\s+(?:is|s|isn t|isnt|ain t|aint|not)\s+loyal\b", norm_text):
-        return True
-    if is_directed(norm_text, has_mention) and re.search(r"\b(disloyal|unloyal|unfaithful|not\s+faithful)\b", norm_text):
-        return True
-    if re.search(r"\b(go|goes|going|went|move|moves|moving|bounce|bounces|bouncing|hop|hops|hopping|switch|switches|switching|jump|jumps|jumping)\s+from\s+(girl|girls|woman|women|female|females)\s+to\s+(girl|girls|woman|women|female|females)\b", norm_text):
-        return True
-    if re.search(r"\b(new|another|different)\s+girl\s+(each|every|per)\s+(day|night|week|month)\b", norm_text):
-        return True
-    if re.search(r"\b(every|each)\s+(day|night|week|month)\s+(a\s+)?(new|different)\s+girl\b", norm_text):
-        return True
-    if re.search(r"\b(has|got|have)\s+(a\s+)?(roster|rotation)\b", norm_text) and any_word(norm_text, list(GIRL_WORDS)):
-        return True
+    if re.search(r"\b\w{2,}\s+(?:lacks|lack|has\s+no|got\s+no|no)\s+loyalty\b", norm_text): return True
+    if re.search(r"\b\w{2,}\s+(?:is|s|isn t|isnt|ain t|aint|not)\s+loyal\b", norm_text): return True
+    if is_directed(norm_text, has_mention) and re.search(r"\b(disloyal|unloyal|unfaithful|not\s+faithful)\b", norm_text): return True
+    if re.search(r"\b(go|goes|going|went|move|moves|moving|bounce|bounces|bouncing|hop|hops|hopping|switch|switches|switching|jump|jumps|jumping)\s+from\s+(girl|girls|woman|women|female|females)\s+to\s+(girl|girls|woman|women|female|females)\b", norm_text): return True
+    if re.search(r"\b(new|another|different)\s+girl\s+(each|every|per)\s+(day|night|week|month)\b", norm_text): return True
+    if re.search(r"\b(every|each)\s+(day|night|week|month)\s+(a\s+)?(new|different)\s+girl\b", norm_text): return True
+    if re.search(r"\b(has|got|have)\s+(a\s+)?(roster|rotation)\b", norm_text) and any_word(norm_text, list(GIRL_WORDS)): return True
     return False
 
-# ---------------- Recent message buffer (multi-message) ----------------
+# ---------------- Recent message buffer ----------------
 MAX_RECENT = 10
-recent_msgs = {}  # key: (guild_id, channel_id, user_id) -> deque[{"norm": str, "time": float, "had_mention": bool, "id": int, "msg": discord.Message|None}]
-
-def get_recent_key(message: discord.Message):
-    return (message.guild.id, message.channel.id, message.author.id)
+recent_msgs = {}
 
 def get_aggregate_text(dq: deque, now: float, window: int) -> tuple[str, bool, list]:
     while dq and (now - dq[0]["time"]) > window:
@@ -250,7 +219,6 @@ def get_aggregate_text(dq: deque, now: float, window: int) -> tuple[str, bool, l
     return agg_text, agg_mentions, recent
 
 async def delete_recent_user_msgs(channel: discord.TextChannel, recent_items: list):
-    # Fast-path: bulk delete messages if possible
     to_delete_objs = [it["msg"] for it in recent_items if it.get("msg") is not None]
     missing_ids = [it["id"] for it in recent_items if it.get("msg") is None]
     if missing_ids:
@@ -291,7 +259,7 @@ def is_guild_manager():
 # -------- Slash commands --------
 @bot.tree.command(name="speak", description="Make the bot say something in a channel")
 @app_commands.describe(text="What should I say?", channel="Where to send it (optional)")
-@app_commands.default_permissions(manage_guild=True)   # only server managers see/use it
+@app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
 async def speak_slash(
     interaction: discord.Interaction,
@@ -299,14 +267,12 @@ async def speak_slash(
     channel: Optional[discord.TextChannel] = None
 ):
     target = channel or interaction.channel
-
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message("You need Manage Server to use this.", ephemeral=True)
         return
-
     try:
-        await target.send(text)  # Posted publicly AS THE BOT (bot bypasses filters)
-        await interaction.response.send_message("Sent ✅", ephemeral=True)  # only you see this
+        await target.send(text)
+        await interaction.response.send_message("Sent ✅", ephemeral=True)
     except discord.Forbidden:
         await interaction.response.send_message("I can't send messages in that channel (missing permission).", ephemeral=True)
 
@@ -315,7 +281,18 @@ async def speak_slash(
 async def ping_slash(interaction: discord.Interaction):
     await interaction.response.send_message("Pong! ✅", ephemeral=True)
 
-# ---------------- Prefix commands (optional) ----------------
+# ---- Fallback prefix: manual sync from Discord if needed ----
+@bot.command(name="syncslash")
+@is_guild_manager()
+async def syncslash_cmd(ctx):
+    """Force re-sync slash commands to this guild (manager-only)."""
+    try:
+        await bot.tree.sync(guild=ctx.guild)
+        await ctx.reply(f"Synced slash commands to guild {ctx.guild.id} ✅")
+    except Exception as e:
+        await ctx.reply(f"Slash sync failed: {e}")
+
+# ---------------- Info / help ----------------
 @bot.command(name="help")
 async def help_cmd(ctx):
     gcfg = get_guild_cfg(ctx.guild.id)
@@ -325,7 +302,8 @@ async def help_cmd(ctx):
         "**Commands (server managers only for config):**\n"
         "`!setwords word1, word2, ...` – set required word combo (at least 2 words)\n"
         "`!setwindow N` – set back-to-back time window in seconds (default 30)\n"
-        "`!config` – show current settings\n\n"
+        "`!config` – show current settings\n"
+        "`!syncslash` – force re-sync slash cmds to this server\n\n"
         f"**Current (this server):** words = [{words}] | window = {gcfg['window']}s\n"
         f"**Defaults (from ENV):** [{default_words}] | window = {config['_default']['window']}s\n"
         "Built-ins: cheater accusations, bitch, super-strict 'f you', player, loyalty, BAN_WORDS, always-ban list, spelled-out letters, Unicode/accents & homoglyph handling."
@@ -363,13 +341,21 @@ async def setwindow_cmd(ctx, seconds: int):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"GUILD_ID env: {GUILD_ID}")
+    if bot.guilds:
+        print("Bot is in these guilds:")
+        for g in bot.guilds:
+            print(f" - {g.name} ({g.id})")
+    else:
+        print("Bot is not in any guilds yet.")
+
     try:
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
-            await bot.tree.sync(guild=guild)  # instant in your server
+            await bot.tree.sync(guild=guild)   # instant in your server
             print(f"Slash commands synced to guild {GUILD_ID}")
         else:
-            await bot.tree.sync()             # global (can take time to appear)
+            await bot.tree.sync()              # global (can be slow to appear)
             print("Slash commands synced globally")
     except Exception as e:
         print("Slash sync failed:", e)
@@ -447,6 +433,7 @@ if not TOKEN:
     print("ERROR: Missing DISCORD_BOT_TOKEN")
     raise SystemExit(1)
 bot.run(TOKEN)
+
 
 
 
