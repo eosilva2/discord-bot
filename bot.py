@@ -4,10 +4,11 @@ import time
 import re
 import asyncio
 import unicodedata
-from typing import List
+from typing import List, Optional
 from collections import deque
 import discord
 from discord.ext import commands
+from discord import app_commands
 
 CONFIG_FILE = "config.json"
 
@@ -79,7 +80,7 @@ def save_config(cfg):
     except Exception:
         pass
 
-config = load_config()
+config = load_config()  # {"<guild_id>": {words, window}, "_default": {words, window}}
 
 def get_guild_cfg(guild_id: int):
     g = str(guild_id)
@@ -89,30 +90,23 @@ def get_guild_cfg(guild_id: int):
     return config[g]
 
 # ---------------- Confusable-aware pattern builder ----------------
-# Minimal, targeted homoglyph/leet classes to avoid false positives
 CONFUSABLES = {
-    "i": ["i","l","1"],         # i ~ l ~ 1
-    "l": ["l","i","1"],         # l ~ i ~ 1
-    "o": ["o","0"],             # o ~ 0
-    "s": ["s","5","$"],         # s ~ 5/$
+    "i": ["i","l","1"],
+    "l": ["l","i","1"],
+    "o": ["o","0"],
+    "s": ["s","5","$"],
     "e": ["e","3"],
     "a": ["a","4","@"],
     "t": ["t","7","+"],
     "b": ["b","8"],
-    # you can add more selectively if needed
 }
 
 def confusable_group(ch: str) -> str:
     opts = CONFUSABLES.get(ch, [ch])
-    # join as alternation group, escape each literal
     return f"(?:{'|'.join(re.escape(o) for o in opts)})"
 
 def confusable_spaced_pat(s: str) -> str:
-    """
-    Build a regex that matches s even if spaces are inserted between letters
-    and confusable glyphs are used for individual characters.
-    We do NOT add trailing \s* after the last char to keep word boundaries working.
-    """
+    # Build regex that matches s even with spaces and confusable glyphs
     parts = [confusable_group(c) for c in s]
     return r"\s*".join(parts)
 
@@ -256,6 +250,7 @@ def get_aggregate_text(dq: deque, now: float, window: int) -> tuple[str, bool, l
     return agg_text, agg_mentions, recent
 
 async def delete_recent_user_msgs(channel: discord.TextChannel, recent_items: list):
+    # Fast-path: bulk delete messages if possible
     to_delete_objs = [it["msg"] for it in recent_items if it.get("msg") is not None]
     missing_ids = [it["id"] for it in recent_items if it.get("msg") is None]
     if missing_ids:
@@ -293,11 +288,29 @@ def is_guild_manager():
         return ctx.author.guild_permissions.manage_guild
     return commands.check(predicate)
 
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print("Ready.")
+# -------- Slash command: /say (only visible/usable by server managers) --------
+@bot.tree.command(name="say", description="Make the bot say something in a channel")
+@app_commands.describe(text="What should I say?", channel="Where to send it (optional)")
+@app_commands.default_permissions(manage_guild=True)   # only server managers see/use it
+@app_commands.guild_only()
+async def say_slash(
+    interaction: discord.Interaction,
+    text: str,
+    channel: Optional[discord.TextChannel] = None
+):
+    target = channel or interaction.channel
 
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You need Manage Server to use this.", ephemeral=True)
+        return
+
+    try:
+        await target.send(text)  # This is posted publicly AS THE BOT (bot bypasses filters)
+        await interaction.response.send_message("Sent ✅", ephemeral=True)  # only you see this
+    except discord.Forbidden:
+        await interaction.response.send_message("I can't send messages in that channel (missing permission).", ephemeral=True)
+
+# ---------------- Standard prefix commands (optional) ----------------
 @bot.command(name="help")
 async def help_cmd(ctx):
     gcfg = get_guild_cfg(ctx.guild.id)
@@ -341,13 +354,27 @@ async def setwindow_cmd(ctx, seconds: int):
     save_config(config)
     await ctx.reply(f"Back-to-back window set to {seconds} seconds.")
 
+# ---------------- Ready & message events ----------------
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    # Register slash commands
+    try:
+        await bot.tree.sync()
+        print("Slash commands synced.")
+    except Exception as e:
+        print("Slash sync failed:", e)
+
 def contains_all_words(text: str, words: List[str]) -> bool:
     text = text.lower()
     return all(w in text for w in words)
 
 @bot.event
 async def on_message(message: discord.Message):
+    # Let prefix commands run
     await bot.process_commands(message)
+
+    # BOT BYPASS: ignore bot messages so the bot can say anything (including cussing) without deletion
     if message.author.bot or not message.guild:
         return
 
@@ -411,6 +438,7 @@ if not TOKEN:
     print("ERROR: Missing DISCORD_BOT_TOKEN")
     raise SystemExit(1)
 bot.run(TOKEN)
+
 
 
 
