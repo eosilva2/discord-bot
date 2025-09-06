@@ -3,6 +3,7 @@ import json
 import time
 import re
 from typing import List
+from collections import deque
 import discord
 from discord.ext import commands
 
@@ -14,8 +15,9 @@ LEET_MAP = str.maketrans({
 })
 
 def normalize(text: str) -> str:
+    """Lowercase, convert common leetspeak, strip punctuation/newlines, collapse spaces."""
     text = text.lower().translate(LEET_MAP)
-    text = re.sub(r"[^a-z0-9@\s]", " ", text)   # keep @ so mentions detectable upstream
+    text = re.sub(r"[^a-z0-9@\s]", " ", text)  # keep @ so mentions are detectable before normalize if needed
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -53,7 +55,7 @@ def save_config(cfg):
     except Exception:
         pass
 
-config = load_config()  # { "<guild_id>": {words, window}, "_default": {words, window} }
+config = load_config()  # {"<guild_id>": {words, window}, "_default": {words, window}}
 
 def get_guild_cfg(guild_id: int):
     g = str(guild_id)
@@ -64,7 +66,7 @@ def get_guild_cfg(guild_id: int):
 
 # ---------------- Dynamic ban list with patterns ----------------
 def spaced_pat(s: str) -> str:
-    # "test" -> "t\s*e\s*s\s*t\s*" so it matches t e s t, t---e__s t, etc.
+    # "test" -> "t\s*e\s*s\s*t\s*" (matches t e s t, t---e__s t, etc.)
     return r"".join(re.escape(c) + r"\s*" for c in s)
 
 def compile_ban_patterns(raw: str):
@@ -76,13 +78,12 @@ def compile_ban_patterns(raw: str):
         if not base_norm:
             continue
         if is_stem:
-            pat = rf"\b{spaced_pat(base_norm)}[a-z0-9]*\b"  # allow suffixes: gay*, fagg*, etc.
+            pat = rf"\b{spaced_pat(base_norm)}[a-z0-9]*\b"   # stems: gay* -> gay/gays/g a y etc.
         else:
-            pat = rf"\b{spaced_pat(base_norm)}\b"
+            pat = rf"\b{spaced_pat(base_norm)}\b"            # exact word (spacing tolerated)
         patterns.append(re.compile(pat))
     return patterns
 
-# load env ban words and compile
 BAN_PATTERNS = compile_ban_patterns(os.getenv("BAN_WORDS", ""))
 
 # Always-ban baseline (compiled too)
@@ -98,7 +99,7 @@ def contains_banned_word(norm_text: str) -> bool:
             return True
     return False
 
-# ---------------- Moderation rules (patterns) ----------------
+# ---------------- Moderation rules (semantic) ----------------
 PRONOUN_TARGETS = {
     "you","u","ur","youre","he","she","they","him","her","them",
     "this","that","it","these","those",
@@ -114,6 +115,7 @@ def is_cheater_accusation(norm_text: str, has_mention: bool) -> bool:
     # "<name> a|is a cheater/cheating"
     if re.search(r"\b\w{2,}\s+(?:is|s|is a|s a|a)\s+cheat\w*\b", norm_text):
         return True
+    # directed accusations / imperatives
     if any_word(norm_text, list(CHEAT_STEMS)):
         if is_directed(norm_text, has_mention):
             return True
@@ -124,6 +126,7 @@ def is_cheater_accusation(norm_text: str, has_mention: bool) -> bool:
     return False
 
 def is_bitch_insult(norm_text: str, has_mention: bool) -> bool:
+    # Single-word handled by ALWAYS_BAN; keep directed & "<name> a bitch"
     if re.search(r"\bbi?atch(es)?\b", norm_text) or has_word(norm_text, "bitch") or has_word(norm_text, "bitches"):
         if is_directed(norm_text, has_mention):
             return True
@@ -136,7 +139,7 @@ def is_fuck_you_super_strict(norm_text: str) -> bool:
         return True
     if re.search(r"\bf\s*you\b", norm_text):        # f you / f-you
         return True
-    if re.search(r"\bf\s*u\b", norm_text):          # f u (even without 'you')
+    if re.search(r"\bf\s*u\b", norm_text):          # f u (even without "you")
         return True
     if re.search(r"\bfu?h+\s*u\b", norm_text):      # fuh u
         return True
@@ -173,8 +176,48 @@ def is_player_implication(norm_text: str, has_mention: bool) -> bool:
         return True
     return False
 
-# ---------------- Cache ----------------
-last_msg_cache = {}  # key: (guild_id, channel_id, user_id) -> { "norm": str, "time": float, "id": int, "had_mention": bool }
+# Loyalty / serial-dating implication
+def is_loyalty_implication(norm_text: str, has_mention: bool) -> bool:
+    if re.search(r"\b\w{2,}\s+(?:lacks|lack|has\s+no|got\s+no|no)\s+loyalty\b", norm_text):
+        return True
+    if re.search(r"\b\w{2,}\s+(?:is|s|isn t|isnt|ain t|aint|not)\s+loyal\b", norm_text):
+        return True
+    if is_directed(norm_text, has_mention) and re.search(r"\b(disloyal|unloyal|unfaithful|not\s+faithful)\b", norm_text):
+        return True
+    if re.search(r"\b(go|goes|going|went|move|moves|moving|bounce|bounces|bouncing|hop|hops|hopping|switch|switches|switching|jump|jumps|jumping)\s+from\s+(girl|girls|woman|women|female|females)\s+to\s+(girl|girls|woman|women|female|females)\b", norm_text):
+        return True
+    if re.search(r"\b(new|another|different)\s+girl\s+(each|every|per)\s+(day|night|week|month)\b", norm_text):
+        return True
+    if re.search(r"\b(every|each)\s+(day|night|week|month)\s+(a\s+)?(new|different)\s+girl\b", norm_text):
+        return True
+    if re.search(r"\b(has|got|have)\s+(a\s+)?(roster|rotation)\b", norm_text) and any_word(norm_text, list(GIRL_WORDS)):
+        return True
+    return False
+
+# ---------------- Recent message buffer (multi-message) ----------------
+MAX_RECENT = 10  # keep last 10 messages per user per channel
+recent_msgs = {}  # key: (guild_id, channel_id, user_id) -> deque[{"norm": str, "time": float, "had_mention": bool, "id": int}]
+
+def get_recent_key(message: discord.Message):
+    return (message.guild.id, message.channel.id, message.author.id)
+
+def get_aggregate_text(dq: deque, now: float, window: int) -> tuple[str, bool]:
+    # remove expired items
+    while dq and (now - dq[0]["time"]) > window:
+        dq.popleft()
+    agg_text = " ".join(item["norm"] for item in dq)
+    agg_mentions = any(item["had_mention"] for item in dq)
+    return agg_text, agg_mentions
+
+async def delete_recent_user_msgs(channel: discord.TextChannel, dq: deque, now: float, window: int):
+    """Delete all recent messages from this user in the window (cleans up B I T C H sequences)."""
+    for item in list(dq):
+        if (now - item["time"]) <= window:
+            try:
+                msg = await channel.fetch_message(item["id"])
+                await msg.delete()
+            except (discord.NotFound, discord.Forbidden):
+                pass
 
 # ---------------- Bot setup ----------------
 intents = discord.Intents.default()
@@ -203,7 +246,8 @@ async def help_cmd(ctx):
         "`!setwindow N` – set back-to-back time window in seconds (default 30)\n"
         "`!config` – show current settings\n\n"
         f"**Current (this server):** words = [{words}] | window = {gcfg['window']}s\n"
-        f"**Defaults (from ENV):** [{default_words}] | window = {config['_default']['window']}s"
+        f"**Defaults (from ENV):** [{default_words}] | window = {config['_default']['window']}s\n"
+        "Built-ins: cheater accusations, bitch, super-strict 'f you', player, loyalty, BAN_WORDS, always-ban list, and spelled-out letters across messages."
     )
 
 @bot.command(name="config")
@@ -240,6 +284,7 @@ def contains_all_words(text: str, words: List[str]) -> bool:
 
 @bot.event
 async def on_message(message: discord.Message):
+    # Let commands run
     await bot.process_commands(message)
     if message.author.bot or not message.guild:
         return
@@ -250,54 +295,72 @@ async def on_message(message: discord.Message):
 
     content_norm = normalize(message.content)
     had_mention = bool(message.mentions)
+    now = time.time()
 
-    # single-message checks
+    # ---------- Single-message checks ----------
     if is_fuck_you_super_strict(content_norm):
-        try: await message.delete()
-        except discord.Forbidden: pass
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
         return
 
     if is_bitch_insult(content_norm, had_mention):
-        try: await message.delete()
-        except discord.Forbidden: pass
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
         return
 
     if is_cheater_accusation(content_norm, had_mention):
-        try: await message.delete()
-        except discord.Forbidden: pass
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
         return
 
     if is_player_implication(content_norm, had_mention):
-        try: await message.delete()
-        except discord.Forbidden: pass
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
+        return
+
+    if is_loyalty_implication(content_norm, had_mention):
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
         return
 
     if contains_banned_word(content_norm):
-        try: await message.delete()
-        except discord.Forbidden: pass
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
         return
 
-    # back-to-back (same user)
-    now = time.time()
+    # ---------- Add to recent buffer ----------
     key = (message.guild.id, message.channel.id, message.author.id)
-    prev = last_msg_cache.get(key)
+    dq = recent_msgs.get(key)
+    if dq is None:
+        dq = deque(maxlen=MAX_RECENT)
+        recent_msgs[key] = dq
+    dq.append({"norm": content_norm, "time": now, "had_mention": had_mention, "id": message.id})
 
-    last_msg_cache[key] = {"norm": content_norm, "time": now, "id": message.id, "had_mention": had_mention}
+    # ---------- Aggregate (multi-message) checks within window ----------
+    agg_text, agg_mentions = get_aggregate_text(dq, now, window)
 
-    if prev and (now - prev["time"]) <= window:
-        combo_norm = f"{prev['norm']} || {content_norm}"
-        if contains_all_words(combo_norm, combo_words):
-            try: await message.delete()
-            except discord.Forbidden: pass
-            return
-        if is_cheater_accusation(combo_norm, had_mention or prev["had_mention"]):
-            try: await message.delete()
-            except discord.Forbidden: pass
-            return
-        if is_player_implication(combo_norm, had_mention or prev["had_mention"]):
-            try: await message.delete()
-            except discord.Forbidden: pass
-            return
+    if (
+        contains_all_words(agg_text, combo_words) or
+        contains_banned_word(agg_text) or
+        is_fuck_you_super_strict(agg_text) or
+        is_cheater_accusation(agg_text, agg_mentions) or
+        is_player_implication(agg_text, agg_mentions) or
+        is_loyalty_implication(agg_text, agg_mentions)
+    ):
+        await delete_recent_user_msgs(message.channel, dq, now, window)
+        return
 
 # ---------------- Run the bot ----------------
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -305,6 +368,7 @@ if not TOKEN:
     print("ERROR: Missing DISCORD_BOT_TOKEN")
     raise SystemExit(1)
 bot.run(TOKEN)
+
 
 
 
