@@ -11,6 +11,7 @@ from discord.ext import commands
 from discord import app_commands
 
 CONFIG_FILE = "config.json"
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # set this in Railway for instant slash sync
 
 # ---------------- Normalization helpers ----------------
 LEET_MAP = str.maketrans({
@@ -242,7 +243,7 @@ def get_recent_key(message: discord.Message):
 
 def get_aggregate_text(dq: deque, now: float, window: int) -> tuple[str, bool, list]:
     while dq and (now - dq[0]["time"]) > window:
-        dq.popLeft = dq.popleft()
+        dq.popleft()
     agg_text = " ".join(item["norm"] for item in dq)
     agg_mentions = any(item["had_mention"] for item in dq)
     recent = [item for item in dq if (now - item["time"]) <= window]
@@ -287,7 +288,7 @@ def is_guild_manager():
         return ctx.author.guild_permissions.manage_guild
     return commands.check(predicate)
 
-# -------- Slash command: /speak (only visible/usable by server managers) --------
+# -------- Slash commands --------
 @bot.tree.command(name="speak", description="Make the bot say something in a channel")
 @app_commands.describe(text="What should I say?", channel="Where to send it (optional)")
 @app_commands.default_permissions(manage_guild=True)   # only server managers see/use it
@@ -309,7 +310,12 @@ async def speak_slash(
     except discord.Forbidden:
         await interaction.response.send_message("I can't send messages in that channel (missing permission).", ephemeral=True)
 
-# ---------------- Standard prefix commands (optional) ----------------
+@bot.tree.command(name="ping", description="Bot latency check")
+@app_commands.guild_only()
+async def ping_slash(interaction: discord.Interaction):
+    await interaction.response.send_message("Pong! ✅", ephemeral=True)
+
+# ---------------- Prefix commands (optional) ----------------
 @bot.command(name="help")
 async def help_cmd(ctx):
     gcfg = get_guild_cfg(ctx.guild.id)
@@ -358,8 +364,13 @@ async def setwindow_cmd(ctx, seconds: int):
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     try:
-        await bot.tree.sync()  # register slash commands
-        print("Slash commands synced.")
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            await bot.tree.sync(guild=guild)  # instant in your server
+            print(f"Slash commands synced to guild {GUILD_ID}")
+        else:
+            await bot.tree.sync()             # global (can take time to appear)
+            print("Slash commands synced globally")
     except Exception as e:
         print("Slash sync failed:", e)
 
@@ -436,6 +447,7 @@ if not TOKEN:
     print("ERROR: Missing DISCORD_BOT_TOKEN")
     raise SystemExit(1)
 bot.run(TOKEN)
+
 
 
 
