@@ -2,6 +2,7 @@ import os
 import json
 import time
 import re
+import asyncio
 from typing import List
 from collections import deque
 import discord
@@ -196,28 +197,58 @@ def is_loyalty_implication(norm_text: str, has_mention: bool) -> bool:
 
 # ---------------- Recent message buffer (multi-message) ----------------
 MAX_RECENT = 10  # keep last 10 messages per user per channel
-recent_msgs = {}  # key: (guild_id, channel_id, user_id) -> deque[{"norm": str, "time": float, "had_mention": bool, "id": int}]
+recent_msgs = {}  # key: (guild_id, channel_id, user_id) -> deque[{"norm": str, "time": float, "had_mention": bool, "id": int, "msg": discord.Message|None}]
 
 def get_recent_key(message: discord.Message):
     return (message.guild.id, message.channel.id, message.author.id)
 
-def get_aggregate_text(dq: deque, now: float, window: int) -> tuple[str, bool]:
+def get_aggregate_text(dq: deque, now: float, window: int) -> tuple[str, bool, list]:
     # remove expired items
     while dq and (now - dq[0]["time"]) > window:
         dq.popleft()
     agg_text = " ".join(item["norm"] for item in dq)
     agg_mentions = any(item["had_mention"] for item in dq)
-    return agg_text, agg_mentions
+    recent = [item for item in dq if (now - item["time"]) <= window]
+    return agg_text, agg_mentions, recent
 
-async def delete_recent_user_msgs(channel: discord.TextChannel, dq: deque, now: float, window: int):
-    """Delete all recent messages from this user in the window (cleans up B I T C H sequences)."""
-    for item in list(dq):
-        if (now - item["time"]) <= window:
+async def delete_recent_user_msgs(channel: discord.TextChannel, recent_items: list):
+    """
+    Fast-path: bulk delete messages if possible.
+    Fall back to per-message deletes for ones we can't bulk.
+    """
+    # Try to use message objects we already stored; fetch any missing concurrently
+    to_delete_objs = [it["msg"] for it in recent_items if it.get("msg") is not None]
+    missing_ids = [it["id"] for it in recent_items if it.get("msg") is None]
+
+    if missing_ids:
+        fetch_tasks = [channel.fetch_message(mid) for mid in missing_ids]
+        for fut in asyncio.as_completed(fetch_tasks):
             try:
-                msg = await channel.fetch_message(item["id"])
-                await msg.delete()
-            except (discord.NotFound, discord.Forbidden):
+                m = await fut
+                to_delete_objs.append(m)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
+
+    # Dedup and keep within Discord's bulk limit (<=100)
+    uniq = {}
+    for m in to_delete_objs:
+        if m: uniq[m.id] = m
+    batch = list(uniq.values())[:100]
+
+    # Bulk delete if 2+ messages
+    if len(batch) >= 2:
+        try:
+            await channel.delete_messages(batch)
+            return
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    # Fallback: delete one-by-one
+    for m in batch:
+        try:
+            await m.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
 
 # ---------------- Bot setup ----------------
 intents = discord.Intents.default()
@@ -247,7 +278,7 @@ async def help_cmd(ctx):
         "`!config` – show current settings\n\n"
         f"**Current (this server):** words = [{words}] | window = {gcfg['window']}s\n"
         f"**Defaults (from ENV):** [{default_words}] | window = {config['_default']['window']}s\n"
-        "Built-ins: cheater accusations, bitch, super-strict 'f you', player, loyalty, BAN_WORDS, always-ban list, and spelled-out letters across messages."
+        "Built-ins: cheater accusations, bitch, super-strict 'f you', player, loyalty, BAN_WORDS, always-ban list, and spelled-out letters across messages (bulk delete)."
     )
 
 @bot.command(name="config")
@@ -346,10 +377,10 @@ async def on_message(message: discord.Message):
     if dq is None:
         dq = deque(maxlen=MAX_RECENT)
         recent_msgs[key] = dq
-    dq.append({"norm": content_norm, "time": now, "had_mention": had_mention, "id": message.id})
+    dq.append({"norm": content_norm, "time": now, "had_mention": had_mention, "id": message.id, "msg": message})
 
     # ---------- Aggregate (multi-message) checks within window ----------
-    agg_text, agg_mentions = get_aggregate_text(dq, now, window)
+    agg_text, agg_mentions, recent_items = get_aggregate_text(dq, now, window)
 
     if (
         contains_all_words(agg_text, combo_words) or
@@ -359,7 +390,7 @@ async def on_message(message: discord.Message):
         is_player_implication(agg_text, agg_mentions) or
         is_loyalty_implication(agg_text, agg_mentions)
     ):
-        await delete_recent_user_msgs(message.channel, dq, now, window)
+        await delete_recent_user_msgs(message.channel, recent_items)
         return
 
 # ---------------- Run the bot ----------------
@@ -368,6 +399,7 @@ if not TOKEN:
     print("ERROR: Missing DISCORD_BOT_TOKEN")
     raise SystemExit(1)
 bot.run(TOKEN)
+
 
 
 
