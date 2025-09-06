@@ -15,7 +15,7 @@ LEET_MAP = str.maketrans({
 
 def normalize(text: str) -> str:
     text = text.lower().translate(LEET_MAP)
-    text = re.sub(r"[^a-z0-9@\s]", " ", text)   # keep @ so mentions still detectable upstream
+    text = re.sub(r"[^a-z0-9@\s]", " ", text)   # keep @ so mentions detectable upstream
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -29,7 +29,6 @@ def any_word(norm_text: str, words: List[str]) -> bool:
 def load_config():
     words_env = os.getenv("WORDS")
     window_env = os.getenv("WINDOW")
-
     default_words = [w.strip().lower() for w in (words_env.split(",") if words_env else ["chunky","cheater"]) if w.strip()]
     try:
         default_window = int(window_env) if window_env else 30
@@ -63,13 +62,41 @@ def get_guild_cfg(guild_id: int):
         save_config(config)
     return config[g]
 
-# ---------------- Dynamic ban list via ENV ----------------
-# Add comma-separated insults in Railway → Variables: BAN_WORDS="idiot, clown, ..."
-BAN_WORDS = [normalize(w) for w in os.getenv("BAN_WORDS", "").split(",") if w.strip()]
-BAN_WORDS = [w for w in BAN_WORDS if w]
+# ---------------- Dynamic ban list with patterns ----------------
+def spaced_pat(s: str) -> str:
+    # "test" -> "t\s*e\s*s\s*t\s*" so it matches t e s t, t---e__s t, etc.
+    return r"".join(re.escape(c) + r"\s*" for c in s)
 
-# Always-ban baseline (now includes 'bitch' too)
+def compile_ban_patterns(raw: str):
+    patterns = []
+    for item in [x.strip() for x in raw.split(",") if x.strip()]:
+        is_stem = item.endswith("*")
+        base = item[:-1] if is_stem else item
+        base_norm = normalize(base)
+        if not base_norm:
+            continue
+        if is_stem:
+            pat = rf"\b{spaced_pat(base_norm)}[a-z0-9]*\b"  # allow suffixes: gay*, fagg*, etc.
+        else:
+            pat = rf"\b{spaced_pat(base_norm)}\b"
+        patterns.append(re.compile(pat))
+    return patterns
+
+# load env ban words and compile
+BAN_PATTERNS = compile_ban_patterns(os.getenv("BAN_WORDS", ""))
+
+# Always-ban baseline (compiled too)
 ALWAYS_BAN = {"hoe", "hoes", "cunt", "bitch", "bitches"}
+ALWAYS_PATTERNS = [re.compile(rf"\b{spaced_pat(normalize(w))}\b") for w in ALWAYS_BAN]
+
+def contains_banned_word(norm_text: str) -> bool:
+    for p in ALWAYS_PATTERNS:
+        if p.search(norm_text):
+            return True
+    for p in BAN_PATTERNS:
+        if p.search(norm_text):
+            return True
+    return False
 
 # ---------------- Moderation rules (patterns) ----------------
 PRONOUN_TARGETS = {
@@ -78,28 +105,25 @@ PRONOUN_TARGETS = {
     "bro","bros","dude","man","guy","guys","girl","girls","boy","boys",
     "buddy","pal","homie","sis","brother","sister","dawg"
 }
-
 CHEAT_STEMS = {"cheat","cheater","cheating","cheated","cheats"}
 
 def is_directed(norm_text: str, has_mention: bool) -> bool:
     return has_mention or any_word(norm_text, list(PRONOUN_TARGETS))
 
 def is_cheater_accusation(norm_text: str, has_mention: bool) -> bool:
-    # Covers "<name> a|is a cheater/cheating"
+    # "<name> a|is a cheater/cheating"
     if re.search(r"\b\w{2,}\s+(?:is|s|is a|s a|a)\s+cheat\w*\b", norm_text):
         return True
-    # General accusations / imperatives
     if any_word(norm_text, list(CHEAT_STEMS)):
         if is_directed(norm_text, has_mention):
             return True
         if re.search(r"\bstop\s+cheat\w*\b", norm_text):
             return True
-        if re.search(r"\b(is|are)\s+cheat\w*\b", norm_text):  # is/are cheating/cheater
+        if re.search(r"\b(is|are)\s+cheat\w*\b", norm_text):
             return True
     return False
 
 def is_bitch_insult(norm_text: str, has_mention: bool) -> bool:
-    # We still detect directed usage and "<name> a bitch", but single-word is handled by ALWAYS_BAN
     if re.search(r"\bbi?atch(es)?\b", norm_text) or has_word(norm_text, "bitch") or has_word(norm_text, "bitches"):
         if is_directed(norm_text, has_mention):
             return True
@@ -108,33 +132,19 @@ def is_bitch_insult(norm_text: str, has_mention: bool) -> bool:
     return False
 
 def is_fuck_you_super_strict(norm_text: str) -> bool:
-    # 'fuck/fck/fuc you'
-    if re.search(r"\bfu?c?k+\s*you\b", norm_text):
+    if re.search(r"\bfu?c?k+\s*you\b", norm_text):  # fuck/fck/fuc you
         return True
-    # 'f you' / 'f-you'
-    if re.search(r"\bf\s*you\b", norm_text):
+    if re.search(r"\bf\s*you\b", norm_text):        # f you / f-you
         return True
-    # 'f u' (even without 'you')
-    if re.search(r"\bf\s*u\b", norm_text):
+    if re.search(r"\bf\s*u\b", norm_text):          # f u (even without 'you')
         return True
-    # 'fuh u' / 'fu u' styles
-    if re.search(r"\bfu?h+\s*u\b", norm_text):
+    if re.search(r"\bfu?h+\s*u\b", norm_text):      # fuh u
         return True
-    # 'fu' + 'you' separated
     if re.search(r"\bfu\b", norm_text) and has_word(norm_text, "you"):
         return True
     return False
 
-def contains_banned_word(norm_text: str) -> bool:
-    for w in ALWAYS_BAN:
-        if re.search(rf"\b{re.escape(w)}\b", norm_text):
-            return True
-    for w in BAN_WORDS:
-        if re.search(rf"\b{re.escape(w)}\b", norm_text):
-            return True
-    return False
-
-# ---- Player implication / “talks to a lot of girls” ----
+# Player implication
 PLAYER_TERMS = {
     "player","playboy","womanizer","womaniser","womanizers","womanisers",
     "fboy","fboi","fuckboy","fuckboi","manwhore"
@@ -146,13 +156,11 @@ def is_player_implication(norm_text: str, has_mention: bool) -> bool:
     if any_word(norm_text, list(PLAYER_TERMS)) or "player" in norm_text:
         if is_directed(norm_text, has_mention):
             return True
-        if re.search(r"\b\w{2,}\s+(?:is|s|is a|s a|a)\s+player\b", norm_text):  # e.g., "bros a player"
+        if re.search(r"\b\w{2,}\s+(?:is|s|is a|s a|a)\s+player\b", norm_text):
             return True
-
     if (any_word(norm_text, list(QTY_WORDS)) and any_word(norm_text, list(GIRL_WORDS))):
         if re.search(r"\b(got|has|have)\b", norm_text) or is_directed(norm_text, has_mention):
             return True
-
     qty = r"(a\s+lot\s+of|many|every|all|lots\s+of|hella)"
     girls = r"(girls?|women|females?|hoes?)"
     if re.search(rf"\b(talk|text|dm|message|chat)(s|ed|ing)?\s+(to|with)\s+{qty}\s+{girls}\b", norm_text):
@@ -165,7 +173,7 @@ def is_player_implication(norm_text: str, has_mention: bool) -> bool:
         return True
     return False
 
-# ---------------- Cache for back-to-back messages ----------------
+# ---------------- Cache ----------------
 last_msg_cache = {}  # key: (guild_id, channel_id, user_id) -> { "norm": str, "time": float, "id": int, "had_mention": bool }
 
 # ---------------- Bot setup ----------------
@@ -226,7 +234,6 @@ async def setwindow_cmd(ctx, seconds: int):
     save_config(config)
     await ctx.reply(f"Back-to-back window set to {seconds} seconds.")
 
-# ---------------- Moderation core ----------------
 def contains_all_words(text: str, words: List[str]) -> bool:
     text = text.lower()
     return all(w in text for w in words)
@@ -244,7 +251,7 @@ async def on_message(message: discord.Message):
     content_norm = normalize(message.content)
     had_mention = bool(message.mentions)
 
-    # Single-message checks
+    # single-message checks
     if is_fuck_you_super_strict(content_norm):
         try: await message.delete()
         except discord.Forbidden: pass
@@ -270,7 +277,7 @@ async def on_message(message: discord.Message):
         except discord.Forbidden: pass
         return
 
-    # Back-to-back logic (same user)
+    # back-to-back (same user)
     now = time.time()
     key = (message.guild.id, message.channel.id, message.author.id)
     prev = last_msg_cache.get(key)
@@ -298,6 +305,7 @@ if not TOKEN:
     print("ERROR: Missing DISCORD_BOT_TOKEN")
     raise SystemExit(1)
 bot.run(TOKEN)
+
 
 
 
