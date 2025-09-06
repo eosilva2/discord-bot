@@ -1,44 +1,164 @@
 import os
 import json
 import time
-import asyncio
 import re
+from typing import List
 import discord
 from discord.ext import commands
 
 CONFIG_FILE = "config.json"
 
-# ---------- Basic Config Persistence ----------
+# ---------------- Normalization helpers ----------------
+LEET_MAP = str.maketrans({
+    "0":"o","1":"i","!":"i","3":"e","4":"a","@":"a","$":"s","5":"s","7":"t","8":"b","+":"t","|":"l"
+})
+
+def normalize(text: str) -> str:
+    """
+    Lowercase, convert common leetspeak, remove most punctuation,
+    collapse whitespace. Keeps spaces so word boundaries still work.
+    """
+    text = text.lower().translate(LEET_MAP)
+    text = re.sub(r"[^a-z0-9@\s]", " ", text)   # keep @ so mentions still detectable upstream
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def has_word(norm_text: str, word: str) -> bool:
+    return re.search(rf"\b{re.escape(word)}\b", norm_text) is not None
+
+def any_word(norm_text: str, words: List[str]) -> bool:
+    return any(has_word(norm_text, w) for w in words)
+
+# ---------------- Config: prefer ENV, fallback to file ----------------
 def load_config():
+    words_env = os.getenv("WORDS")
+    window_env = os.getenv("WINDOW")
+
+    default_words = [w.strip().lower() for w in (words_env.split(",") if words_env else ["chunky","cheater"]) if w.strip()]
+    try:
+        default_window = int(window_env) if window_env else 30
+    except ValueError:
+        default_window = 30
+
+    cfg = {}
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+
+    cfg.setdefault("_default", {"words": default_words, "window": default_window})
+    return cfg
 
 def save_config(cfg):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
 
-config = load_config()  # {guild_id: {"words": ["chunky","cheater"], "window": 30}}
+config = load_config()  # { "<guild_id>": {words, window}, "_default": {words, window} }
 
 def get_guild_cfg(guild_id: int):
     g = str(guild_id)
     if g not in config:
-        config[g] = {"words": ["chunky", "cheater"], "window": 30}
+        config[g] = dict(config["_default"])
         save_config(config)
     return config[g]
 
-# ---------- Cache for back-to-back messages ----------
-# key: (guild_id, channel_id, user_id) -> value: {"content": str, "time": float, "message_id": int}
-last_msg_cache = {}
+# ---------------- Dynamic ban list via ENV ----------------
+# Add comma-separated insults in Railway → Variables: BAN_WORDS="idiot, clown, ..."
+BAN_WORDS = [normalize(w) for w in os.getenv("BAN_WORDS", "").split(",") if w.strip()]
+BAN_WORDS = [w for w in BAN_WORDS if w]
 
-# ---------- Bot Setup ----------
+# ---------------- Moderation rules (patterns) ----------------
+PRONOUN_TARGETS = {"you","u","ur","youre","he","she","they","him","her","them","this","that","it","these","those"}
+CHEAT_STEMS = {"cheat","cheater","cheating","cheated","cheats"}
+
+def is_directed(norm_text: str, has_mention: bool) -> bool:
+    # Directed at a person or thing: mentions OR pronouns/demonstratives present
+    return has_mention or any_word(norm_text, list(PRONOUN_TARGETS))
+
+def is_cheater_accusation(norm_text: str, has_mention: bool) -> bool:
+    # "you're a cheater", "stop cheating", "he is cheating"
+    if not any_word(norm_text, list(CHEAT_STEMS)):
+        return False
+    if is_directed(norm_text, has_mention):
+        return True
+    if re.search(r"\bstop\s+cheat", norm_text):
+        return True
+    if re.search(r"\bis\s+cheat", norm_text):  # is cheating / is cheater
+        return True
+    return False
+
+def is_bitch_insult(norm_text: str, has_mention: bool) -> bool:
+    # catches bitch/biatch + obfuscations after normalization
+    if re.search(r"\bbi?atch(es)?\b", norm_text) or has_word(norm_text, "bitch") or has_word(norm_text, "bitches"):
+        return is_directed(norm_text, has_mention)
+    return False
+
+def is_fuck_you_super_strict(norm_text: str) -> bool:
+    # super strict "fuck you" (and obfuscations), includes "f you", "f u"
+    if re.search(r"\bfu?c?k+\s*you\b", norm_text):  # fuck/fck/fuc you
+        return True
+    if re.search(r"\bf\s*you\b", norm_text):        # f you / f-you
+        return True
+    if re.search(r"\bf\s*u\b", norm_text) and has_word(norm_text, "you"):
+        return True
+    if re.search(r"\bfu\b", norm_text) and has_word(norm_text, "you"):
+        return True
+    return False
+
+def contains_banned_word(norm_text: str) -> bool:
+    for w in BAN_WORDS:
+        if re.search(rf"\b{re.escape(w)}\b", norm_text):
+            return True
+    return False
+
+# ---- NEW: "player" implication / talks to a lot of girls ----
+PLAYER_TERMS = {
+    "player","playboy","womanizer","womaniser","womanizers","womanisers",
+    "ladies","ladiesman","ladiesman",  # we'll also catch "ladies man" via regex below
+    "fboy","fboi","fuckboy","fuckboi","manwhore"
+}
+GIRL_WORDS = {"girl","girls","woman","women","female","females"}
+
+def is_player_implication(norm_text: str, has_mention: bool) -> bool:
+    if not is_directed(norm_text, has_mention):
+        return False
+
+    # direct labels
+    if any_word(norm_text, list(PLAYER_TERMS)):
+        return True
+    if re.search(r"\blad(?:ies)?\s*man\b", norm_text):  # ladies man / ladyman
+        return True
+
+    # implies "talks/texts/DMs/flirts with many/all/every girls/women"
+    qty = r"(a\s+lot\s+of|many|every|all)"
+    girls = r"(girls?|women|females?)"
+
+    if re.search(rf"\b(talk|text|dm|message|chat)(s|ed|ing)?\s+(to|with)\s+{qty}\s+{girls}\b", norm_text):
+        return True
+    if re.search(rf"\b(flirt|rizz)(s|ed|ing)?\s+(with\s+)?{qty}\s+{girls}\b", norm_text):
+        return True
+    # "in everyone's DMs", "in her DMs" (with quantity/target implied)
+    if re.search(r"\b(slide|sliding|slid|slides)\s+(in|into)\s+(\w+\s+)?dm(s)?\b", norm_text) and (
+        any_word(norm_text, ["everyone","every","all","many"]) or any_word(norm_text, list(GIRL_WORDS))
+    ):
+        return True
+
+    return False
+
+# ---------------- Cache for back-to-back messages ----------------
+last_msg_cache = {}  # key: (guild_id, channel_id, user_id) -> { "norm": str, "time": float, "id": int, "had_mention": bool }
+
+# ---------------- Bot setup ----------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# Utility: only allow server managers to run config commands
 def is_guild_manager():
     async def predicate(ctx):
         return ctx.author.guild_permissions.manage_guild
@@ -53,12 +173,15 @@ async def on_ready():
 async def help_cmd(ctx):
     gcfg = get_guild_cfg(ctx.guild.id)
     words = ", ".join(gcfg["words"])
+    default_words = ", ".join(config["_default"]["words"])
     await ctx.reply(
         "**Commands (server managers only for config):**\n"
         "`!setwords word1, word2, ...` – set required word combo (at least 2 words)\n"
         "`!setwindow N` – set back-to-back time window in seconds (default 30)\n"
         "`!config` – show current settings\n\n"
-        f"**Current:** words = [{words}] | window = {gcfg['window']}s"
+        f"**Current (this server):** words = [{words}] | window = {gcfg['window']}s\n"
+        f"**Defaults (from ENV):** [{default_words}] | window = {config['_default']['window']}s\n"
+        f"**Built-in filters:** cheater accusations (incl. back-to-back), 'bitch' (directed), 'fuck you' (super-strict), 'player' implication, BAN_WORDS list."
     )
 
 @bot.command(name="config")
@@ -69,7 +192,6 @@ async def config_cmd(ctx):
 @bot.command(name="setwords")
 @is_guild_manager()
 async def setwords_cmd(ctx, *, args: str):
-    # Split by comma, strip whitespace, lower
     words = [w.strip().lower() for w in args.split(",") if w.strip()]
     if len(words) < 2:
         await ctx.reply("Please provide at least **two** words, e.g. `!setwords chunky, cheater`")
@@ -90,72 +212,87 @@ async def setwindow_cmd(ctx, seconds: int):
     save_config(config)
     await ctx.reply(f"Back-to-back window set to {seconds} seconds.")
 
-# ---------- Moderation Logic ----------
-def contains_all_words(text: str, words: list[str]) -> bool:
+# ---------------- Moderation core ----------------
+def contains_all_words(text: str, words: List[str]) -> bool:
     text = text.lower()
     return all(w in text for w in words)
 
-def wordset_regex(words: list[str]) -> re.Pattern:
-    # For same-message combos where order doesn't matter; require all words to appear in any order.
-    # We'll just use contains_all_words for simplicity; regex could be added for word boundaries if desired.
-    return None  # not used in this minimal version
-
 @bot.event
 async def on_message(message: discord.Message):
-    # Let commands run
     await bot.process_commands(message)
 
     if message.author.bot or not message.guild:
         return
 
     gcfg = get_guild_cfg(message.guild.id)
-    words = gcfg["words"]
+    combo_words = gcfg["words"]
     window = gcfg["window"]
 
-    # Case 1: same-message contains all words
-    content = message.content.lower()
-    if contains_all_words(content, words):
-        try:
-            await message.delete()
-        except discord.Forbidden:
-            pass
+    # Normalize current content and detect mentions
+    content_norm = normalize(message.content)
+    had_mention = bool(message.mentions)
+
+    # --- Built-in filters (single message) ---
+    if is_fuck_you_super_strict(content_norm):
+        try: await message.delete()
+        except discord.Forbidden: pass
         return
 
-    # Case 2: two back-to-back messages by the same user (within window)
+    if is_bitch_insult(content_norm, had_mention):
+        try: await message.delete()
+        except discord.Forbidden: pass
+        return
+
+    if is_cheater_accusation(content_norm, had_mention):
+        try: await message.delete()
+        except discord.Forbidden: pass
+        return
+
+    if is_player_implication(content_norm, had_mention):
+        try: await message.delete()
+        except discord.Forbidden: pass
+        return
+
+    if contains_banned_word(content_norm):
+        try: await message.delete()
+        except discord.Forbidden: pass
+        return
+
+    # --- Back-to-back logic (same user) ---
     now = time.time()
     key = (message.guild.id, message.channel.id, message.author.id)
     prev = last_msg_cache.get(key)
 
-    # Update cache BEFORE return (so if someone sends only one of the words we can see it on next msg)
-    last_msg_cache[key] = {"content": content, "time": now, "message_id": message.id}
+    # Update cache for next time (store normalized)
+    last_msg_cache[key] = {"norm": content_norm, "time": now, "id": message.id, "had_mention": had_mention}
 
-    if prev:
-        # Only consider if within window
-        if (now - prev["time"]) <= window:
-            prev_text = prev["content"]
-            # If split across the two messages, e.g. (prev has word A, current has word B) in any order
-            # We require that the union of both messages contains all words.
-            combo_text = f"{prev_text} || {content}"
-            if contains_all_words(combo_text, words):
-                try:
-                    # Delete the latest message (and optionally the previous one too)
-                    await message.delete()
-                    # Optional: also remove the previous message to keep things clean
-                    # prev_msg = await message.channel.fetch_message(prev["message_id"])
-                    # await prev_msg.delete()
-                except discord.Forbidden:
-                    pass
+    if prev and (now - prev["time"]) <= window:
+        combo_norm = f"{prev['norm']} || {content_norm}"
+        if contains_all_words(combo_norm, combo_words):
+            try: await message.delete()
+            except discord.Forbidden: pass
+            return
 
-    # Optional cleanup: purge stale cache entries occasionally (lightweight)
-    # Not strictly necessary for small servers.
+        # Cheater accusation across two back-to-back messages
+        if is_cheater_accusation(combo_norm, had_mention or prev["had_mention"]):
+            try: await message.delete()
+            except discord.Forbidden: pass
+            return
 
+        # Player implication across two back-to-back messages
+        if is_player_implication(combo_norm, had_mention or prev["had_mention"]):
+            try: await message.delete()
+            except discord.Forbidden: pass
+            return
 
-import os
+# ---------------- Run the bot ----------------
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 if not TOKEN:
     print("ERROR: Missing DISCORD_BOT_TOKEN")
     raise SystemExit(1)
+
 bot.run(TOKEN)
+
 
 
 
