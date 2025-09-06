@@ -64,15 +64,14 @@ def get_guild_cfg(guild_id: int):
     return config[g]
 
 # ---------------- Dynamic ban list via ENV ----------------
-# Add comma-separated insults in Railway → Variables: BAN_WORDS="idiot, clown, ...".
+# Add comma-separated insults in Railway → Variables: BAN_WORDS="idiot, clown, ..."
 BAN_WORDS = [normalize(w) for w in os.getenv("BAN_WORDS", "").split(",") if w.strip()]
 BAN_WORDS = [w for w in BAN_WORDS if w]
 
-# Always-ban baseline (works even if BAN_WORDS is empty)
-ALWAYS_BAN = {"hoe", "hoes", "cunt"}
+# Always-ban baseline (now includes 'bitch' too)
+ALWAYS_BAN = {"hoe", "hoes", "cunt", "bitch", "bitches"}
 
 # ---------------- Moderation rules (patterns) ----------------
-# Expanded “directed” vocabulary so lines like "bros a player" or "chunky a bitch" count
 PRONOUN_TARGETS = {
     "you","u","ur","youre","he","she","they","him","her","them",
     "this","that","it","these","those",
@@ -83,47 +82,53 @@ PRONOUN_TARGETS = {
 CHEAT_STEMS = {"cheat","cheater","cheating","cheated","cheats"}
 
 def is_directed(norm_text: str, has_mention: bool) -> bool:
-    # Mentions OR any people-ish token present
     return has_mention or any_word(norm_text, list(PRONOUN_TARGETS))
 
 def is_cheater_accusation(norm_text: str, has_mention: bool) -> bool:
-    if not any_word(norm_text, list(CHEAT_STEMS)):
-        return False
-    if is_directed(norm_text, has_mention):
+    # Covers "<name> a|is a cheater/cheating"
+    if re.search(r"\b\w{2,}\s+(?:is|s|is a|s a|a)\s+cheat\w*\b", norm_text):
         return True
-    if re.search(r"\bstop\s+cheat", norm_text):
-        return True
-    if re.search(r"\bis\s+cheat", norm_text):  # "is cheating/cheater"
-        return True
+    # General accusations / imperatives
+    if any_word(norm_text, list(CHEAT_STEMS)):
+        if is_directed(norm_text, has_mention):
+            return True
+        if re.search(r"\bstop\s+cheat\w*\b", norm_text):
+            return True
+        if re.search(r"\b(is|are)\s+cheat\w*\b", norm_text):  # is/are cheating/cheater
+            return True
     return False
 
 def is_bitch_insult(norm_text: str, has_mention: bool) -> bool:
-    # Catch “bitch/biatch” directed OR in patterns like "<name> (is|'s|a) bitch"
+    # We still detect directed usage and "<name> a bitch", but single-word is handled by ALWAYS_BAN
     if re.search(r"\bbi?atch(es)?\b", norm_text) or has_word(norm_text, "bitch") or has_word(norm_text, "bitches"):
         if is_directed(norm_text, has_mention):
             return True
-        # "<token> is a bitch" / "<token> 's a bitch" / "<token> a bitch"
-        if re.search(r"\b\w{2,}\s+(is|s|is a|s a|a)\s+bitch(es)?\b", norm_text):
+        if re.search(r"\b\w{2,}\s+(?:is|s|is a|s a|a)\s+bitch(?:es)?\b", norm_text):
             return True
     return False
 
 def is_fuck_you_super_strict(norm_text: str) -> bool:
-    if re.search(r"\bfu?c?k+\s*you\b", norm_text):  # fuck/fck/fuc you
+    # 'fuck/fck/fuc you'
+    if re.search(r"\bfu?c?k+\s*you\b", norm_text):
         return True
-    if re.search(r"\bf\s*you\b", norm_text):        # f you / f-you
+    # 'f you' / 'f-you'
+    if re.search(r"\bf\s*you\b", norm_text):
         return True
-    if re.search(r"\bf\s*u\b", norm_text) and has_word(norm_text, "you"):
+    # 'f u' (even without 'you')
+    if re.search(r"\bf\s*u\b", norm_text):
         return True
+    # 'fuh u' / 'fu u' styles
+    if re.search(r"\bfu?h+\s*u\b", norm_text):
+        return True
+    # 'fu' + 'you' separated
     if re.search(r"\bfu\b", norm_text) and has_word(norm_text, "you"):
         return True
     return False
 
 def contains_banned_word(norm_text: str) -> bool:
-    # Always-ban set
     for w in ALWAYS_BAN:
         if re.search(rf"\b{re.escape(w)}\b", norm_text):
             return True
-    # Custom BAN_WORDS env list
     for w in BAN_WORDS:
         if re.search(rf"\b{re.escape(w)}\b", norm_text):
             return True
@@ -138,20 +143,16 @@ GIRL_WORDS = {"girl","girls","woman","women","female","females","hoe","hoes"}
 QTY_WORDS = {"hella","many","every","all","lots","lot","alot","a lot"}
 
 def is_player_implication(norm_text: str, has_mention: bool) -> bool:
-    # Directed via mention/pronoun OR explicit "<token> (is|'s|a) player"
     if any_word(norm_text, list(PLAYER_TERMS)) or "player" in norm_text:
         if is_directed(norm_text, has_mention):
             return True
-        if re.search(r"\b\w{2,}\s+(is|s|is a|s a|a)\s+player\b", norm_text):  # e.g., "bros a player"
+        if re.search(r"\b\w{2,}\s+(?:is|s|is a|s a|a)\s+player\b", norm_text):  # e.g., "bros a player"
             return True
 
-    # Quantity + girls/hoes even if not explicitly directed
     if (any_word(norm_text, list(QTY_WORDS)) and any_word(norm_text, list(GIRL_WORDS))):
-        # catch phrases like "got/has/he got hella girls/hoes"
         if re.search(r"\b(got|has|have)\b", norm_text) or is_directed(norm_text, has_mention):
             return True
 
-    # Texting/DMs/flirting many girls patterns
     qty = r"(a\s+lot\s+of|many|every|all|lots\s+of|hella)"
     girls = r"(girls?|women|females?|hoes?)"
     if re.search(rf"\b(talk|text|dm|message|chat)(s|ed|ing)?\s+(to|with)\s+{qty}\s+{girls}\b", norm_text):
@@ -162,7 +163,6 @@ def is_player_implication(norm_text: str, has_mention: bool) -> bool:
         any_word(norm_text, ["everyone","every","all","many","hella"]) or any_word(norm_text, list(GIRL_WORDS))
     ):
         return True
-
     return False
 
 # ---------------- Cache for back-to-back messages ----------------
@@ -195,9 +195,7 @@ async def help_cmd(ctx):
         "`!setwindow N` – set back-to-back time window in seconds (default 30)\n"
         "`!config` – show current settings\n\n"
         f"**Current (this server):** words = [{words}] | window = {gcfg['window']}s\n"
-        f"**Defaults (from ENV):** [{default_words}] | window = {config['_default']['window']}s\n"
-        f"**Built-in filters:** cheater accusations (incl. back-to-back), 'bitch' (directed or '<name> a bitch'), "
-        f"'fuck you' (super-strict), 'player' implication (incl. back-to-back & hella girls/hoes), BAN_WORDS, and baseline hoe/hoes/cunt."
+        f"**Defaults (from ENV):** [{default_words}] | window = {config['_default']['window']}s"
     )
 
 @bot.command(name="config")
@@ -300,6 +298,7 @@ if not TOKEN:
     print("ERROR: Missing DISCORD_BOT_TOKEN")
     raise SystemExit(1)
 bot.run(TOKEN)
+
 
 
 
