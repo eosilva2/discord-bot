@@ -1,345 +1,439 @@
-# ======== LIVE LYRICS ADD-ON ========
-# Requires: pip install lrclibapi
-import math
-import aiohttp
-from lrclib import LrcLibAPI
-from dataclasses import dataclass
+import os
+import json
+import time
+import re
+import asyncio
+import unicodedata
+from typing import List, Optional
+from collections import deque
+import discord
+from discord.ext import commands
+from discord import app_commands
 
-LYRICS_USER_AGENT = os.getenv("LRCLIB_USER_AGENT", "discord-lyrics-bot/1.0")
+CONFIG_FILE = "config.json"
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # set this in Railway for instant slash sync
 
-# Keep one active session per guild so you don’t get duplicates
-_active_lyrics: dict[int, "LyricsSession"] = {}
+# ---------------- Normalization helpers ----------------
+LEET_MAP = str.maketrans({
+    "0":"o","1":"i","!":"i","3":"e","4":"a","@":"a","$":"s","5":"s","7":"t","8":"b","+":"t","|":"l"
+})
 
-@dataclass
-class LrcLine:
-    t: float   # seconds from start
-    text: str
+# Unicode folding for characters not handled by accent stripping alone
+UNICODE_FOLD_MAP = {
+    "ß": "ss", "þ": "th", "ð": "d", "đ": "d", "ħ": "h", "ł": "l",
+    "ø": "o", "œ": "oe", "æ": "ae", "å": "a",
+    "ś": "s", "ş": "s", "š": "s",
+    "č": "c", "ć": "c", "ç": "c",
+    "ñ": "n", "ğ": "g",
+    "ý": "y",
+    "ı": "i",
+}
+UNI_TRANS = str.maketrans(UNICODE_FOLD_MAP)
 
-class LyricsSession:
-    def __init__(self, guild_id: int, channel: discord.TextChannel, track: str, artist: str,
-                 lrc_lines: list[LrcLine], duration: int | None):
-        self.guild_id = guild_id
-        self.channel = channel
-        self.track = track
-        self.artist = artist
-        self.lines = sorted(lrc_lines, key=lambda x: x.t)
-        self.duration = duration
-        self.offset = 0.0
-        self._task: asyncio.Task | None = None
-        self._start_monotonic = time.monotonic()
-        self._msg: discord.Message | None = None
-        self._last_index = -1
-        self._stopped = asyncio.Event()
+def strip_accents(text: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in nfkd if unicodedata.category(ch) != "Mn")
 
-    def now(self) -> float:
-        return time.monotonic() - self._start_monotonic + self.offset
+def normalize(text: str) -> str:
+    text = text.lower()
+    text = strip_accents(text)
+    text = text.translate(UNI_TRANS)
+    text = text.translate(LEET_MAP)
+    text = re.sub(r"[^a-z0-9@\s]", " ", text)  # keep @ for mentions
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-    def stop(self):
-        self._stopped.set()
+def has_word(norm_text: str, word: str) -> bool:
+    return re.search(rf"\b{re.escape(word)}\b", norm_text) is not None
 
-    async def run(self):
-        # create/update a single message that we keep editing
-        header = f"🎤 **{self.artist} — {self.track}**"
+def any_word(norm_text: str, words: List[str]) -> bool:
+    return any(has_word(norm_text, w) for w in words)
+
+# ---------------- Config ----------------
+def load_config():
+    words_env = os.getenv("WORDS")
+    window_env = os.getenv("WINDOW")
+    default_words = [w.strip().lower() for w in (words_env.split(",") if words_env else ["chunky","cheater"]) if w.strip()]
+    try:
+        default_window = int(window_env) if window_env else 30
+    except ValueError:
+        default_window = 30
+
+    cfg = {}
+    if os.path.exists(CONFIG_FILE):
         try:
-            self._msg = await self.channel.send(header + "\nStarting…")
-        except discord.Forbidden:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+    cfg.setdefault("_default", {"words": default_words, "window": default_window})
+    return cfg
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+config = load_config()
+
+def get_guild_cfg(guild_id: int):
+    g = str(guild_id)
+    if g not in config:
+        config[g] = dict(config["_default"])
+        save_config(config)
+    return config[g]
+
+# ---------------- Confusable-aware pattern builder ----------------
+CONFUSABLES = {
+    "i": ["i","l","1"],
+    "l": ["l","i","1"],
+    "o": ["o","0"],
+    "s": ["s","5","$"],
+    "e": ["e","3"],
+    "a": ["a","4","@"],
+    "t": ["t","7","+"],
+    "b": ["b","8"],
+}
+def confusable_group(ch: str) -> str:
+    opts = CONFUSABLES.get(ch, [ch])
+    return f"(?:{'|'.join(re.escape(o) for o in opts)})"
+def confusable_spaced_pat(s: str) -> str:
+    parts = [confusable_group(c) for c in s]
+    return r"\s*".join(parts)
+
+# ---------------- Dynamic ban list ----------------
+def compile_ban_patterns(raw: str):
+    patterns = []
+    for item in [x.strip() for x in raw.split(",") if x.strip()]:
+        is_stem = item.endswith("*")
+        base = item[:-1] if is_stem else item
+        base_norm = normalize(base)
+        if not base_norm:
+            continue
+        core = confusable_spaced_pat(base_norm)
+        if is_stem:
+            pat = rf"\b{core}[a-z0-9]*\b"
+        else:
+            pat = rf"\b{core}\b"
+        patterns.append(re.compile(pat))
+    return patterns
+
+BAN_PATTERNS = compile_ban_patterns(os.getenv("BAN_WORDS", ""))
+
+ALWAYS_BAN = {"hoe", "hoes", "cunt", "bitch", "bitches"}
+ALWAYS_PATTERNS = [re.compile(rf"\b{confusable_spaced_pat(normalize(w))}\b") for w in ALWAYS_BAN]
+
+def contains_banned_word(norm_text: str) -> bool:
+    for p in ALWAYS_PATTERNS:
+        if p.search(norm_text):
+            return True
+    for p in BAN_PATTERNS:
+        if p.search(norm_text):
+            return True
+    return False
+
+# ---------------- Semantic rules ----------------
+PRONOUN_TARGETS = {
+    "you","u","ur","youre","he","she","they","him","her","them",
+    "this","that","it","these","those",
+    "bro","bros","dude","man","guy","guys","girl","girls","boy","boys",
+    "buddy","pal","homie","sis","brother","sister","dawg"
+}
+CHEAT_STEMS = {"cheat","cheater","cheating","cheated","cheats"}
+
+def is_directed(norm_text: str, has_mention: bool) -> bool:
+    return has_mention or any_word(norm_text, list(PRONOUN_TARGETS))
+
+def is_cheater_accusation(norm_text: str, has_mention: bool) -> bool:
+    if re.search(r"\b\w{2,}\s+(?:is|s|is a|s a|a)\s+cheat\w*\b", norm_text):
+        return True
+    if any_word(norm_text, list(CHEAT_STEMS)):
+        if is_directed(norm_text, has_mention):
+            return True
+        if re.search(r"\bstop\s+cheat\w*\b", norm_text):
+            return True
+        if re.search(r"\b(is|are)\s+cheat\w*\b", norm_text):
+            return True
+    return False
+
+def is_bitch_insult(norm_text: str, has_mention: bool) -> bool:
+    if re.search(r"\bbi?atch(es)?\b", norm_text) or has_word(norm_text, "bitch") or has_word(norm_text, "bitches"):
+        if is_directed(norm_text, has_mention):
+            return True
+        if re.search(r"\b\w{2,}\s+(?:is|s|is a|s a|a)\s+bitch(?:es)?\b", norm_text):
+            return True
+    return False
+
+def is_fuck_you_super_strict(norm_text: str) -> bool:
+    if re.search(r"\bfu?c?k+\s*you\b", norm_text): return True
+    if re.search(r"\bf\s*you\b", norm_text): return True
+    if re.search(r"\bf\s*u\b", norm_text): return True
+    if re.search(r"\bfu?h+\s*u\b", norm_text): return True
+    if re.search(r"\bfu\b", norm_text) and has_word(norm_text, "you"): return True
+    return False
+
+PLAYER_TERMS = {
+    "player","playboy","womanizer","womaniser","womanizers","womanisers",
+    "fboy","fboi","fuckboy","fuckboi","manwhore"
+}
+GIRL_WORDS = {"girl","girls","woman","women","female","females","hoe","hoes"}
+QTY_WORDS = {"hella","many","every","all","lots","lot","alot","a lot"}
+
+def is_player_implication(norm_text: str, has_mention: bool) -> bool:
+    if any_word(norm_text, list(PLAYER_TERMS)) or "player" in norm_text:
+        if is_directed(norm_text, has_mention): return True
+        if re.search(r"\b\w{2,}\s+(?:is|s|is a|s a|a)\s+player\b", norm_text): return True
+    if (any_word(norm_text, list(QTY_WORDS)) and any_word(norm_text, list(GIRL_WORDS))):
+        if re.search(r"\b(got|has|have)\b", norm_text) or is_directed(norm_text, has_mention): return True
+    qty = r"(a\s+lot\s+of|many|every|all|lots\s+of|hella)"
+    girls = r"(girls?|women|females?|hoes?)"
+    if re.search(rf"\b(talk|text|dm|message|chat)(s|ed|ing)?\s+(to|with)\s+{qty}\s+{girls}\b", norm_text): return True
+    if re.search(rf"\b(flirt|rizz)(s|ed|ing)?\s+(with\s+)?{qty}\s+{girls}\b", norm_text): return True
+    if re.search(r"\b(slide|sliding|slid|slides)\s+(in|into)\s+(\w+\s+)?dm(s)?\b", norm_text) and (
+        any_word(norm_text, ["everyone","every","all","many","hella"]) or any_word(norm_text, list(GIRL_WORDS))
+    ): return True
+    return False
+
+def is_loyalty_implication(norm_text: str, has_mention: bool) -> bool:
+    if re.search(r"\b\w{2,}\s+(?:lacks|lack|has\s+no|got\s+no|no)\s+loyalty\b", norm_text): return True
+    if re.search(r"\b\w{2,}\s+(?:is|s|isn t|isnt|ain t|aint|not)\s+loyal\b", norm_text): return True
+    if is_directed(norm_text, has_mention) and re.search(r"\b(disloyal|unloyal|unfaithful|not\s+faithful)\b", norm_text): return True
+    if re.search(r"\b(go|goes|going|went|move|moves|moving|bounce|bounces|bouncing|hop|hops|hopping|switch|switches|switching|jump|jumps|jumping)\s+from\s+(girl|girls|woman|women|female|females)\s+to\s+(girl|girls|woman|women|female|females)\b", norm_text): return True
+    if re.search(r"\b(new|another|different)\s+girl\s+(each|every|per)\s+(day|night|week|month)\b", norm_text): return True
+    if re.search(r"\b(every|each)\s+(day|night|week|month)\s+(a\s+)?(new|different)\s+girl\b", norm_text): return True
+    if re.search(r"\b(has|got|have)\s+(a\s+)?(roster|rotation)\b", norm_text) and any_word(norm_text, list(GIRL_WORDS)): return True
+    return False
+
+# ---------------- Recent message buffer ----------------
+MAX_RECENT = 10
+recent_msgs = {}
+
+def get_aggregate_text(dq: deque, now: float, window: int) -> tuple[str, bool, list]:
+    while dq and (now - dq[0]["time"]) > window:
+        dq.popleft()
+    agg_text = " ".join(item["norm"] for item in dq)
+    agg_mentions = any(item["had_mention"] for item in dq)
+    recent = [item for item in dq if (now - item["time"]) <= window]
+    return agg_text, agg_mentions, recent
+
+async def delete_recent_user_msgs(channel: discord.TextChannel, recent_items: list):
+    to_delete_objs = [it["msg"] for it in recent_items if it.get("msg") is not None]
+    missing_ids = [it["id"] for it in recent_items if it.get("msg") is None]
+    if missing_ids:
+        fetch_tasks = [channel.fetch_message(mid) for mid in missing_ids]
+        for fut in asyncio.as_completed(fetch_tasks):
+            try:
+                m = await fut
+                to_delete_objs.append(m)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+    uniq = {}
+    for m in to_delete_objs:
+        if m: uniq[m.id] = m
+    batch = list(uniq.values())[:100]
+    if len(batch) >= 2:
+        try:
+            await channel.delete_messages(batch)
             return
-
-        while not self._stopped.is_set():
-            t = self.now()
-            i = self._find_current_index(t)
-            if i != self._last_index:
-                self._last_index = i
-                prev_line = self.lines[i-1].text if i > 0 else " "
-                curr_line = self.lines[i].text if 0 <= i < len(self.lines) else "【End】"
-                next_line = self.lines[i+1].text if i+1 < len(self.lines) else " "
-
-                body = (
-                    f"{header}\n"
-                    f"```text\n"
-                    f"{truncate(prev_line)}\n"
-                    f"> {truncate(curr_line)}\n"
-                    f"{truncate(next_line)}\n"
-                    f"```\n"
-                    f"_/lyrics offset ±seconds • /lyrics stop_"
-                )
-                try:
-                    await self._msg.edit(content=body)
-                except discord.HTTPException:
-                    pass
-
-            # graceful stop at end (+ a tiny buffer)
-            if self.duration and t > (self.duration + 5):
-                break
-
-            await asyncio.sleep(0.25)
-
-        # tidy
-        _active_lyrics.pop(self.guild_id, None)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    for m in batch:
         try:
-            if self._msg:
-                await self._msg.edit(content=f"🎤 **{self.artist} — {self.track}**\n_lyrics session ended_")
-        except discord.HTTPException:
+            await m.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
 
-    def _find_current_index(self, t: float) -> int:
-        # binary search would be faster; linear is fine for a few hundred lines
-        idx = 0
-        for i, line in enumerate(self.lines):
-            if line.t <= t:
-                idx = i
-            else:
-                break
-        return idx
+# ---------------- Bot setup ----------------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.messages = True
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-def truncate(s: str, n: int = 140) -> str:
-    return s if len(s) <= n else s[: n-1] + "…"
+def is_guild_manager():
+    async def predicate(ctx):
+        return ctx.author.guild_permissions.manage_guild
+    return commands.check(predicate)
 
-# ---------- LRCLIB helpers ----------
-_api = LrcLibAPI(user_agent=LYRICS_USER_AGENT)
-
-async def fetch_lrclib(track: str, artist: str, album: str | None = None, duration: int | None = None):
-    """
-    Returns (lrc_text, duration_seconds) or (None, None) if not found.
-    Uses LRCLIB get_lyrics; will fall back to a search if needed.
-    """
-    loop = asyncio.get_running_loop()
-
-    def _get():
-        try:
-            return _api.get_lyrics(
-                track_name=track,
-                artist_name=artist,
-                album_name=album or "",
-                duration=int(duration) if duration else None,
-            )
-        except Exception:
-            return None
-
-    lyrics = await loop.run_in_executor(None, _get)
-    if not lyrics:
-        # fallback: try search then get by id
-        def _search_get():
-            try:
-                res = _api.search_lyrics(track_name=track, artist_name=artist)
-                if not res:
-                    return None
-                # pick the closest by duration if available
-                if duration:
-                    best = min(res, key=lambda r: abs((r.duration or duration) - duration))
-                else:
-                    best = res[0]
-                return _api.get_lyrics_by_id(best.id)
-            except Exception:
-                return None
-        lyrics = await loop.run_in_executor(None, _search_get)
-
-    if not lyrics:
-        return None, None
-
-    lrc_text = lyrics.synced_lyrics or None
-    plain = lyrics.plain_lyrics or None
-    dur = lyrics.duration or duration or None
-    # Prefer synced; if only plain, we’ll pseudo-time it later
-    return (lrc_text or plain), (dur if isinstance(dur, int) else None)
-
-def parse_lrc_to_lines(lrc_text: str, duration_hint: int | None) -> list[LrcLine]:
-    """
-    Parse LRC into time-tagged lines.
-    If text is not LRC (no [mm:ss] tags), fake timestamps across duration.
-    """
-    tag_re = re.compile(r"\[(\d{1,2}):(\d{1,2})(?:\.(\d{1,2}))?\]")
-    lines: list[LrcLine] = []
-
-    has_tags = bool(tag_re.search(lrc_text or ""))
-
-    if has_tags:
-        for raw in lrc_text.splitlines():
-            tags = list(tag_re.finditer(raw))
-            if not tags:
-                continue
-            content = tag_re.sub("", raw).strip()
-            if not content:
-                continue
-            for m in tags:
-                mm = int(m.group(1))
-                ss = int(m.group(2))
-                cs = int(m.group(3) or 0)
-                t = mm * 60 + ss + (cs / (10 ** len(m.group(3))) if m.group(3) else 0)
-                lines.append(LrcLine(t=t, text=content))
-    else:
-        # plain lyrics — distribute evenly
-        stripped = [ln.strip() for ln in (lrc_text or "").splitlines() if ln.strip()]
-        if not stripped:
-            return []
-        dur = duration_hint or max(120, len(stripped) * 3)  # guess
-        step = max(1.5, dur / max(1, len(stripped)))
-        t = 0.0
-        for ln in stripped:
-            lines.append(LrcLine(t=t, text=ln))
-            t += step
-
-    # de-dup consecutive identical lines and sort
-    cleaned = []
-    last = None
-    for ln in sorted(lines, key=lambda x: x.t):
-        if ln.text != last:
-            cleaned.append(ln)
-            last = ln.text
-    return cleaned
-
-# ---------- “Now Playing” auto-detect (best effort) ----------
-async def detect_np_in_channel(channel: discord.TextChannel) -> tuple[str | None, str | None, int | None]:
-    """
-    Try to find a recent "now playing" message (common patterns many music bots use).
-    Return (track, artist, duration_seconds)
-    """
-    async for msg in channel.history(limit=50):
-        # prefer bot messages with embeds
-        if msg.author.bot:
-            # 1) Check embed “Now Playing” style
-            for emb in msg.embeds:
-                text = " ".join(filter(None, [emb.title or "", emb.description or ""])).lower()
-                if "now playing" in text or "playing" in text:
-                    # Try to parse "Artist - Track" or "Track - Artist"
-                    parts = split_title_artist(emb.title or emb.description or "")
-                    if parts:
-                        return parts[1], parts[0], parse_duration_from_text(emb.description or emb.title or "")
-            # 2) Check plain content
-            lower = (msg.content or "").lower()
-            if "now playing" in lower or "playing:" in lower:
-                parts = split_title_artist(msg.content)
-                if parts:
-                    return parts[1], parts[0], parse_duration_from_text(msg.content)
-    return None, None, None
-
-def split_title_artist(s: str) -> tuple[str, str] | None:
-    # Try common splits: "Artist - Track", "Track — Artist", "Track by Artist"
-    if " - " in s:
-        a, b = s.split(" - ", 1)
-        # We don’t know order; guess by “by”
-        if " by " in b.lower():
-            # "Track - by Artist"
-            b = b.split(" by ", 1)[1]
-        return a.strip(), b.strip()
-    if " — " in s:
-        a, b = s.split(" — ", 1)
-        return a.strip(), b.strip()
-    m = re.search(r"(.+?)\s+by\s+(.+)", s, re.I)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
-    return None
-
-def parse_duration_from_text(s: str) -> int | None:
-    # find 3:45 or 03:45 in string
-    m = re.search(r"(\d{1,2}):(\d{2})", s)
-    if not m: return None
-    return int(m.group(1))*60 + int(m.group(2))
-
-# ---------- Slash commands ----------
-lyrics_group = app_commands.Group(name="lyrics", description="Live lyrics controls")
-bot.tree.add_command(lyrics_group)
-
-@lyrics_group.command(name="start", description="Start live lyrics in this channel (or pick a channel).")
-@app_commands.describe(query="Optional: 'Song Title - Artist' (leave empty to auto-detect Now Playing)",
-                       channel="Where to post the lyrics")
+# -------- Slash commands --------
+@bot.tree.command(name="speak", description="Make the bot say something in a channel")
+@app_commands.describe(text="What should I say?", channel="Where to send it (optional)")
+@app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
-async def lyrics_start(interaction: discord.Interaction,
-                       query: str | None = None,
-                       channel: Optional[discord.TextChannel] = None):
+async def speak_slash(
+    interaction: discord.Interaction,
+    text: str,
+    channel: Optional[discord.TextChannel] = None
+):
+    target = channel or interaction.channel
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message("You need Manage Server to use this.", ephemeral=True)
         return
+    try:
+        await target.send(text)
+        await interaction.response.send_message("Sent ✅", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("I can't send messages in that channel (missing permission).", ephemeral=True)
 
-    ch = channel or interaction.channel
-    await interaction.response.defer(ephemeral=True, thinking=True)
+@bot.tree.command(name="ping", description="Bot latency check")
+@app_commands.guild_only()
+async def ping_slash(interaction: discord.Interaction):
+    await interaction.response.send_message("Pong! ✅", ephemeral=True)
 
-    track = artist = None
-    duration = None
+# ---- Fallback prefix: manual sync from Discord if needed ----
+@bot.command(name="syncslash")
+@is_guild_manager()
+async def syncslash_cmd(ctx):
+    """Force re-sync slash commands to this guild (manager-only)."""
+    try:
+        await bot.tree.sync(guild=ctx.guild)
+        await ctx.reply(f"Synced slash commands to guild {ctx.guild.id} ✅")
+    except Exception as e:
+        await ctx.reply(f"Slash sync failed: {e}")
 
-    if query:
-        parts = split_title_artist(query)
-        if parts:
-            # parts returns (a,b); but we don’t know which is artist/title; assume "Title - Artist" first, swap as needed
-            # Try both ways (we’ll search either way)
-            title_guess, artist_guess = parts[0], parts[1]
-            track, artist = title_guess.strip(), artist_guess.strip()
-        else:
-            # fallback: assume "Title" only
-            track = query.strip()
-    else:
-        # auto-detect from channel history (music bot messages)
-        t, a, d = await detect_np_in_channel(ch)
-        if t and a:
-            track, artist, duration = t, a, d
-
-    if not track:
-        await interaction.followup.send("Couldn’t detect the current track. Provide a `query` like `Song - Artist`.", ephemeral=True)
-        return
-
-    # fetch lyrics from LRCLIB
-    lrc_text, found_dur = await fetch_lrclib(track=track, artist=artist or "", duration=duration)
-    if not lrc_text:
-        await interaction.followup.send(f"Couldn’t find lyrics for **{artist or '?'} — {track}**.", ephemeral=True)
-        return
-
-    lines = parse_lrc_to_lines(lrc_text, duration_hint=found_dur)
-    if not lines:
-        await interaction.followup.send("Lyrics exist but couldn’t be parsed.", ephemeral=True)
-        return
-
-    # stop old session if any
-    old = _active_lyrics.get(interaction.guild_id)
-    if old:
-        old.stop()
-
-    sess = LyricsSession(
-        guild_id=interaction.guild_id,
-        channel=ch,
-        track=track,
-        artist=artist or "Unknown",
-        lrc_lines=lines,
-        duration=found_dur,
+# ---------------- Info / help ----------------
+@bot.command(name="help")
+async def help_cmd(ctx):
+    gcfg = get_guild_cfg(ctx.guild.id)
+    words = ", ".join(gcfg["words"])
+    default_words = ", ".join(config["_default"]["words"])
+    await ctx.reply(
+        "**Commands (server managers only for config):**\n"
+        "`!setwords word1, word2, ...` – set required word combo (at least 2 words)\n"
+        "`!setwindow N` – set back-to-back time window in seconds (default 30)\n"
+        "`!config` – show current settings\n"
+        "`!syncslash` – force re-sync slash cmds to this server\n\n"
+        f"**Current (this server):** words = [{words}] | window = {gcfg['window']}s\n"
+        f"**Defaults (from ENV):** [{default_words}] | window = {config['_default']['window']}s\n"
+        "Built-ins: cheater accusations, bitch, super-strict 'f you', player, loyalty, BAN_WORDS, always-ban list, spelled-out letters, Unicode/accents & homoglyph handling."
     )
-    _active_lyrics[interaction.guild_id] = sess
-    sess._task = asyncio.create_task(sess.run())
-    await interaction.followup.send(f"Starting live lyrics in <#{ch.id}> for **{sess.artist} — {sess.track}**.", ephemeral=True)
 
-@lyrics_group.command(name="stop", description="Stop live lyrics in this server")
-@app_commands.guild_only()
-async def lyrics_stop(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("You need Manage Server to use this.", ephemeral=True)
-        return
-    sess = _active_lyrics.get(interaction.guild_id)
-    if not sess:
-        await interaction.response.send_message("No active lyrics session.", ephemeral=True)
-        return
-    sess.stop()
-    await interaction.response.send_message("Stopped the lyrics session. ✅", ephemeral=True)
+@bot.command(name="config")
+async def config_cmd(ctx):
+    gcfg = get_guild_cfg(ctx.guild.id)
+    await ctx.reply(f"Words: {gcfg['words']}\nWindow: {gcfg['window']} seconds")
 
-@lyrics_group.command(name="offset", description="Adjust sync by +/- seconds (e.g., -1.2 or 0.5)")
-@app_commands.describe(seconds="Negative to move earlier, positive to move later")
-@app_commands.guild_only()
-async def lyrics_offset(interaction: discord.Interaction, seconds: float):
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("You need Manage Server to use this.", ephemeral=True)
+@bot.command(name="setwords")
+@is_guild_manager()
+async def setwords_cmd(ctx, *, args: str):
+    words = [w.strip().lower() for w in args.split(",") if w.strip()]
+    if len(words) < 2:
+        await ctx.reply("Please provide at least **two** words, e.g. `!setwords chunky, cheater`")
         return
-    sess = _active_lyrics.get(interaction.guild_id)
-    if not sess:
-        await interaction.response.send_message("No active lyrics session.", ephemeral=True)
+    gcfg = get_guild_cfg(ctx.guild.id)
+    gcfg["words"] = words
+    save_config(config)
+    await ctx.reply(f"Updated word combo to: {words}")
+
+@bot.command(name="setwindow")
+@is_guild_manager()
+async def setwindow_cmd(ctx, seconds: int):
+    if seconds < 1 or seconds > 600:
+        await ctx.reply("Please choose a window between 1 and 600 seconds.")
         return
-    sess.offset += seconds
-    await interaction.response.send_message(f"Offset set to {sess.offset:+.2f}s.", ephemeral=True)
+    gcfg = get_guild_cfg(ctx.guild.id)
+    gcfg["window"] = seconds
+    save_config(config)
+    await ctx.reply(f"Back-to-back window set to {seconds} seconds.")
 
-# Ensure slash cmds sync (your on_ready already syncs; this keeps guild-fast path working)
-try:
-    if GUILD_ID:
-        asyncio.get_event_loop().create_task(bot.tree.sync(guild=discord.Object(id=GUILD_ID)))
-except Exception:
-    pass
+# ---------------- Ready & message events ----------------
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"GUILD_ID env: {GUILD_ID}")
+    if bot.guilds:
+        print("Bot is in these guilds:")
+        for g in bot.guilds:
+            print(f" - {g.name} ({g.id})")
+    else:
+        print("Bot is not in any guilds yet.")
 
-# ======== END LIVE LYRICS ADD-ON ========
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            await bot.tree.sync(guild=guild)   # instant in your server
+            print(f"Slash commands synced to guild {GUILD_ID}")
+        else:
+            await bot.tree.sync()              # global (can be slow to appear)
+            print("Slash commands synced globally")
+    except Exception as e:
+        print("Slash sync failed:", e)
+
+def contains_all_words(text: str, words: List[str]) -> bool:
+    text = text.lower()
+    return all(w in text for w in words)
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Let prefix commands run
+    await bot.process_commands(message)
+
+    # BOT BYPASS: ignore bot messages so the bot can say anything without deletion
+    if message.author.bot or not message.guild:
+        return
+
+    gcfg = get_guild_cfg(message.guild.id)
+    combo_words = gcfg["words"]
+    window = gcfg["window"]
+
+    content_norm = normalize(message.content)
+    had_mention = bool(message.mentions)
+    now = time.time()
+
+    # ---------- Single-message checks ----------
+    if is_fuck_you_super_strict(content_norm):
+        try: await message.delete()
+        except discord.Forbidden: pass
+        return
+    if is_bitch_insult(content_norm, had_mention):
+        try: await message.delete()
+        except discord.Forbidden: pass
+        return
+    if is_cheater_accusation(content_norm, had_mention):
+        try: await message.delete()
+        except discord.Forbidden: pass
+        return
+    if is_player_implication(content_norm, had_mention):
+        try: await message.delete()
+        except discord.Forbidden: pass
+        return
+    if is_loyalty_implication(content_norm, had_mention):
+        try: await message.delete()
+        except discord.Forbidden: pass
+        return
+    if contains_banned_word(content_norm):
+        try: await message.delete()
+        except discord.Forbidden: pass
+        return
+
+    # ---------- Buffer & aggregate (multi-message) ----------
+    key = (message.guild.id, message.channel.id, message.author.id)
+    dq = recent_msgs.get(key)
+    if dq is None:
+        dq = deque(maxlen=MAX_RECENT)
+        recent_msgs[key] = dq
+    dq.append({"norm": content_norm, "time": now, "had_mention": had_mention, "id": message.id, "msg": message})
+
+    agg_text, agg_mentions, recent_items = get_aggregate_text(dq, now, window)
+    if (
+        contains_all_words(agg_text, combo_words) or
+        contains_banned_word(agg_text) or
+        is_fuck_you_super_strict(agg_text) or
+        is_cheater_accusation(agg_text, agg_mentions) or
+        is_player_implication(agg_text, agg_mentions) or
+        is_loyalty_implication(agg_text, agg_mentions)
+    ):
+        await delete_recent_user_msgs(message.channel, recent_items)
+        return
+
+# ---------------- Run the bot ----------------
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+if not TOKEN:
+    print("ERROR: Missing DISCORD_BOT_TOKEN")
+    raise SystemExit(1)
+bot.run(TOKEN)
+
 
 
 
